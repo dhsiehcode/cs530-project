@@ -5,6 +5,7 @@ Sidebar panel with three sections:
   3. Simulation  – CPU/GPU selector, Run button, info bar
 """
 from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QGroupBox, QComboBox, QCheckBox,
     QLabel, QLineEdit, QPushButton, QTreeWidget, QTreeWidgetItem,
@@ -24,20 +25,24 @@ class ObstacleSelector(QWidget):
         self.name = obs.name
         self.obs = obs
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(6, 6, 6, 6)
+        #layout.setContentsMargins(6, 6, 6, 6)
 
         layout.addWidget(QLabel(f"{self.name}"))
 
         self.x_edit = QLineEdit()
         self.x_edit.setPlaceholderText("X")
+        self.x_edit.setMinimumHeight(30)
 
         self.y_edit = QLineEdit()
         self.y_edit.setPlaceholderText("Y")
+        self.y_edit.setMinimumHeight(30)
 
         layout.addWidget(self.x_edit)
         layout.addWidget(self.y_edit)
+        layout.addSpacing(6)
 
         add_button = QPushButton("Add Obstacle")
+        add_button.setMinimumHeight(32)
         layout.addWidget(add_button)
 
         add_button.clicked.connect(self._add_clicked)
@@ -86,8 +91,8 @@ class SidebarPanel(QWidget):
 
         ## laytout
         layout = QVBoxLayout(self)
-        layout.setSpacing(8)
-        layout.setContentsMargins(8, 8, 8, 8)
+        #layout.setSpacing(8)
+        #layout.setContentsMargins(8, 8, 8, 8)
         layout.setAlignment(Qt.AlignTop)
 
         ## scalar field selector
@@ -125,18 +130,27 @@ class SidebarPanel(QWidget):
         self.obstacle_tree.itemDoubleClicked.connect(self._handle_obstacle_double_click)
         layout.addWidget(self.obstacle_tree)
 
-        ## obstacle selector
+        ## obstacle selector (scrollable)
         layout.addWidget(QLabel("Add Obstacle"))
-        obstacle_panel = QVBoxLayout()
+        obstacle_panel_widget = QWidget()
+        obstacle_panel = QVBoxLayout(obstacle_panel_widget)
         for od in PRECONFIGURED_OBSTACLES:
             box = QGroupBox()
+            obstacle_font = box.font()
+            obstacle_font.setPointSize(obstacle_font.pointSize() + 2)
+            box.setFont(obstacle_font)
             box_layout = QVBoxLayout(box)
+            box_layout.setContentsMargins(0, 0, 0, 0)
             selector = ObstacleSelector(od)
             selector.obstacle_added.connect(self._add_obstacle)
             box_layout.addWidget(selector)
             obstacle_panel.addWidget(box)
+        obstacle_panel.addStretch()
 
-        layout.addLayout(obstacle_panel)
+        obstacle_scroll = QScrollArea()
+        obstacle_scroll.setWidgetResizable(True)
+        obstacle_scroll.setWidget(obstacle_panel_widget)
+        layout.addWidget(obstacle_scroll)
         layout.addStretch()
 
     def current_scalar_field(self) -> str:
