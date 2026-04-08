@@ -59,9 +59,9 @@ class PlacedObstacle:
 
 
 PRECONFIGURED_OBSTACLES = [
-    ObstacleDef("Small Rock",  "rock", radius=0.4,  height=0.20),
-    ObstacleDef("Medium Rock", "rock", radius=0.7,  height=0.30),
-    ObstacleDef("Large Rock",  "rock", radius=1.0,  height=0.40),
+    ObstacleDef("Small Rock",  "rock", radius=0.2,  height=0.20),
+    ObstacleDef("Medium Rock", "rock", radius=0.3,  height=0.30),
+    ObstacleDef("Large Rock",  "rock", radius=0.5,  height=0.40),
     ObstacleDef("Small Log",   "log",  radius=0.15, height=0.40, length=1.5),
     ObstacleDef("Large Log",   "log",  radius=0.20, height=0.50, length=3.0),
 ]
