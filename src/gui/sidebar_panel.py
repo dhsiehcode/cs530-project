@@ -173,6 +173,7 @@ class SidebarPanel(QWidget):
         item.setData(0, Qt.UserRole, placed_obs.obstacle_id)
         self.obstacle_tree.addTopLevelItem(item)
         self.obstacle_added.emit(obs, x, y)
+        self.obstacles_changed.emit()
 
     def _handle_obstacle_double_click(self, item, column):
         dialog = DeleteObstacleDialog(self)
@@ -181,13 +182,14 @@ class SidebarPanel(QWidget):
             obstacle_id = item.data(0, Qt.UserRole)
 
             # Remove from obstacle list
-            self.obstacles = [
+            self.placed_obstacles = [
                 obs for obs in self.placed_obstacles
                 if obs.obstacle_id != obstacle_id
             ]
             index = self.obstacle_tree.indexOfTopLevelItem(item)
             if index >= 0:
                 self.obstacle_tree.takeTopLevelItem(index)
+            self.obstacles_changed.emit()
 
 
 

@@ -21,16 +21,33 @@ def build_bed_elevation(config: SimConfig, obstacles: list) -> np.ndarray:
 
     for obs in obstacles:
         defn = obs.definition
+        print("####### Adding Obstacle ###############")
+        print(obs.x)
+        print(obs.y)
         cx = obs.x / config.dx
         cy = obs.y / config.dy
 
         if defn.kind == "rock":
             # Smooth cosine bump (zero-gradient at center and edge)
+            
             r_cells = defn.radius / config.dx
             dist = np.sqrt((ii - cx) ** 2 + (jj - cy) ** 2)
             mask = dist < r_cells
             vals = defn.height * 0.5 * (1.0 + np.cos(np.pi * np.minimum(dist / r_cells, 1.0)))
             b = np.maximum(b, vals * mask)
+            
+            ## cylinder for testing
+            '''
+            r_cells = defn.radius / config.dx
+            dist = np.sqrt((ii - cx) ** 2 + (jj - cy) ** 2)
+
+            mask = dist < r_cells
+            vals = defn.height * mask.astype(np.float32)
+
+            b = np.maximum(b, vals)
+            '''
+            print(b.shape)
+
 
         elif defn.kind == "log":
             # Smooth cosine ridge
@@ -49,9 +66,9 @@ def build_bed_elevation(config: SimConfig, obstacles: list) -> np.ndarray:
                 np.abs(dy_local) / r_cells, 1.0)))
             vals = defn.height * cross_profile
             b = np.maximum(b, vals * mask)
-
     # Cap bed so water depth is always >= 30% of h0 (prevents extreme acceleration)
-    max_bed = config.h0 * 0.7
+    #max_bed = config.h0 * 0.7
+    max_bed = config.h0 * 0.3
     b = np.minimum(b, max_bed)
     return b
 
@@ -59,9 +76,11 @@ def build_bed_elevation(config: SimConfig, obstacles: list) -> np.ndarray:
 # ------------------------------------------------------------------ #
 #  VTK Rock meshes                                                #
 # ------------------------------------------------------------------ #
-def create_rock_mesh(obs: PlacedObstacle) -> vtk.vtkPolyData:
+def create_rock_mesh(
+    obs: PlacedObstacle, warp_scale: float = 1.0, seed: int | None = None
+) -> vtk.vtkPolyData:
     """Return a vtkPolyData sphere with surface noise (rocky look)."""
-    rng = random.Random()
+    rng = random.Random(seed)
     r = obs.definition.radius
 
     sphere = vtk.vtkSphereSource()

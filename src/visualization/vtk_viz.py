@@ -305,6 +305,14 @@ class VTKPipeline:
         self.scalar_bar = None
         self.corner_annotation = None
 
+    def update_obstacles(self, obstacles: list):
+        """Replace obstacle actors with the given obstacle list."""
+        for actor in self.obstacle_actors:
+            self.renderer.RemoveActor(actor)
+        self.obstacle_actors.clear()
+        self._add_obstacles(obstacles)
+        self.renderer.GetRenderWindow().Render()
+
     # ------------------------------------------------------------------ #
     #  Internal helpers                                                   #
     # ------------------------------------------------------------------ #

@@ -77,9 +77,11 @@ class BottomControlBar(QWidget):
         if self.timer.isActive():
             self.timer.stop()
             self.play_btn.setText("Play")
+            self.playback_toggled.emit(False)
         else:
             self.timer.start()
             self.play_btn.setText("Pause")
+            self.playback_toggled.emit(True)
 
     def step_back(self):
         self.pause()
@@ -95,6 +97,7 @@ class BottomControlBar(QWidget):
     def pause(self):
         self.timer.stop()
         self.play_btn.setText("Play")
+        self.playback_toggled.emit(False)
 
     def set_frame(self, f):
         f = max(0, min(f, self.MAX_FRAMES - 1))
