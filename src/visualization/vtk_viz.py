@@ -103,10 +103,10 @@ class VTKPipeline:
         n = nx * ny
         self._live_arrays = {}
         self._live_buffers = {}
-        for name in ("h", "vx", "vy", "speed", "vorticity", "pressure"):
+        for name in ("h", "eta", "vx", "vy", "speed", "vorticity", "pressure"):
             buffer = np.full(
                 n,
-                self.config.h0 if name == "h" else 0.0,
+                self.config.h0 if name in ("h", "eta") else 0.0,
                 dtype=np.float32,
             )
             a = numpy_to_vtk(buffer, deep=True)
@@ -139,7 +139,7 @@ class VTKPipeline:
         if self._live_image is None:
             return
 
-        for name in ("h", "vx", "vy", "speed", "vorticity", "pressure"):
+        for name in ("h", "eta", "vx", "vy", "speed", "vorticity", "pressure"):
             np.copyto(
                 self._live_buffers[name],
                 frame_data[name].flatten(order="F").astype(np.float32, copy=False),
@@ -434,8 +434,15 @@ class VTKPipeline:
         geom = vtk.vtkImageDataGeometryFilter()
         geom.SetInputConnection(self._get_source_port())
 
+        # Warp by η = h + b (free-surface elevation) so the surface is
+        # physically flat at rest and only real perturbations appear as bumps.
+        assign_eta = vtk.vtkAssignAttribute()
+        assign_eta.SetInputConnection(geom.GetOutputPort())
+        assign_eta.Assign("eta", vtk.vtkDataSetAttributes.SCALARS,
+                          vtk.vtkAssignAttribute.POINT_DATA)
+
         warp = vtk.vtkWarpScalar()
-        warp.SetInputConnection(geom.GetOutputPort())
+        warp.SetInputConnection(assign_eta.GetOutputPort())
         warp.SetScaleFactor(self.config.warp_scale)
 
         # Normals for proper specular highlights (water sheen)
@@ -470,14 +477,19 @@ class VTKPipeline:
     def _build_glyphs(self):
         sub = vtk.vtkExtractVOI()
         sub.SetInputConnection(self._get_source_port())
-        sample_rate = 24 if self._is_live else 16
+        sample_rate = 48 if self._is_live else 16
         sub.SetSampleRate(sample_rate, sample_rate, 1)
 
         geom = vtk.vtkImageDataGeometryFilter()
         geom.SetInputConnection(sub.GetOutputPort())
 
+        assign_eta = vtk.vtkAssignAttribute()
+        assign_eta.SetInputConnection(geom.GetOutputPort())
+        assign_eta.Assign("eta", vtk.vtkDataSetAttributes.SCALARS,
+                          vtk.vtkAssignAttribute.POINT_DATA)
+
         warp = vtk.vtkWarpScalar()
-        warp.SetInputConnection(geom.GetOutputPort())
+        warp.SetInputConnection(assign_eta.GetOutputPort())
         warp.SetScaleFactor(self.config.warp_scale)
 
         assign_v = vtk.vtkAssignAttribute()
@@ -487,8 +499,8 @@ class VTKPipeline:
 
         arrow = vtk.vtkArrowSource()
         arrow.SetTipLength(0.3)
-        arrow.SetTipRadius(0.1)
-        arrow.SetShaftRadius(0.03)
+        arrow.SetTipRadius(0.2)
+        arrow.SetShaftRadius(0.08)
 
         glyph = vtk.vtkGlyph3D()
         glyph.SetInputConnection(assign_v.GetOutputPort())
@@ -509,6 +521,7 @@ class VTKPipeline:
 
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
+        actor.AddPosition(0, 0, self.config.glyph_z_offset)
         actor.GetProperty().SetOpacity(0.9)
         actor.SetVisibility(self.show_glyphs)
 
@@ -543,6 +556,7 @@ class VTKPipeline:
 
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
+        actor.AddPosition(0, 0, self.config.contour_z_offset)
         actor.GetProperty().SetOpacity(0.85 if self._is_live else 0.75)
         actor.SetVisibility(self.show_contours)
 
@@ -593,6 +607,7 @@ class VTKPipeline:
 
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
+        actor.AddPosition(0, 0, self.config.streamline_z_offset)
         actor.GetProperty().SetOpacity(0.85 if self._is_live else 0.75)
         actor.SetVisibility(self.show_streamlines)
 

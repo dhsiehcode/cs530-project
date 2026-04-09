@@ -4,8 +4,8 @@ from dataclasses import dataclass
 
 @dataclass
 class SimConfig:
-    nx: int = 512 ## x dimension
-    ny: int = 256 ## y dimension
+    nx: int = 256 ## x dimension
+    ny: int = 128 ## y dimension
     dx: float = 0.039 ## cell size in grid
     dy: float = 0.039 ## cell size in grid
     h0: float = 0.5 ## surface height
@@ -13,15 +13,19 @@ class SimConfig:
     uy: float = 0.0 ## velocity in y direction
     v: float = 0.011 ## kinematic viscosity 
     g: float = 9.81 ## gravity
-    dt: float = 0.0088 ## Time difference between each solver step  
+    #dt: float = 0.0088 ## Time difference between each solver step  
+    dt: float = 0.005 
     export_interval: float = 0.1 ## Frequency of output frame
-    sim_time: float = 20.0 ## simulation time 
+    sim_time: float = 10.0 ## simulation time
     use_gpu: bool = False
-    warp_scale: float = 3.0
-    live_preview_nx: int = 128
-    live_preview_ny: int = 64
+    warp_scale: float = 4.0
+    live_preview_nx: int = 256
+    live_preview_ny: int = 128
     live_preview_max_fps: int = 8
     live_preview_range_update_interval: int = 4
+    contour_z_offset: float = 0.0 # z offset for contours
+    glyph_z_offset: float = 0.2 # z offset for glyphs 
+    streamline_z_offset: float = 0.15 # z offset for streamlines 
 
     @property
     def num_frames(self) -> int:
@@ -59,9 +63,9 @@ class PlacedObstacle:
 
 
 PRECONFIGURED_OBSTACLES = [
-    ObstacleDef("Small Rock",  "rock", radius=0.2,  height=0.20),
-    ObstacleDef("Medium Rock", "rock", radius=0.3,  height=0.30),
-    ObstacleDef("Large Rock",  "rock", radius=0.5,  height=0.40),
+    ObstacleDef("Small Rock",  "rock", radius=0.2 * 2,  height=0.20),
+    ObstacleDef("Medium Rock", "rock", radius=0.3 * 2,  height=0.30),
+    ObstacleDef("Large Rock",  "rock", radius=0.5 * 2,  height=0.40),
     ObstacleDef("Small Log",   "log",  radius=0.15, height=0.40, length=1.5),
     ObstacleDef("Large Log",   "log",  radius=0.20, height=0.50, length=3.0),
 ]

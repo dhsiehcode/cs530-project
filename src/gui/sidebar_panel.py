@@ -110,13 +110,13 @@ class SidebarPanel(QWidget):
         )
 
         ## layers selector
-        self.layers = ["water surface", "glyphs", "streamlines"]
+        self.layers = ["water surface", "glyphs", "streamlines","contours"]
         self.layer_checks = []
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             checkbox = QCheckBox(layer)
             checkbox.setChecked(True)
             checkbox.toggled.connect(
-                lambda checked, idx=i: self.layer_toggled.emit(layer, checked)
+                lambda checked, l=layer: self.layer_toggled.emit(l, checked)
             )
             self.layer_checks.append(checkbox)
             layout.addWidget(checkbox)

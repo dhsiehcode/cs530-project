@@ -21,6 +21,7 @@ vortices and recirculation zones to survive.  Stability requires
 
 Supports both CPU and GPU backends via Taichi.
 """
+import math
 import taichi as ti
 import numpy as np
 
@@ -73,7 +74,8 @@ class SWESolver:
     """
 
     def __init__(self, nx: int, ny: int, dx: float, dy: float,
-                 dt: float, g: float, nu: float, h0: float, u0: float):
+                 dt: float, g: float, nu: float, h0: float, u0: float,
+                 ramp_steps: int = 0):
         self.nx, self.ny = nx, ny
         self.dx, self.dy = dx, dy
         self.dt = dt
@@ -81,6 +83,8 @@ class SWESolver:
         self.nu = nu
         self.h0_val = h0
         self.u0_val = u0
+        self._ramp_steps = max(1, ramp_steps)
+        self._step_count = 0
 
         # conserved variables (double-buffered)
         self.h  = ti.field(dtype=ti.f32, shape=(nx, ny))
@@ -109,9 +113,14 @@ class SWESolver:
 
     def step(self):
         """Advance one time-step (Lax-Friedrichs + η-gradient)."""
-        self._lax_friedrichs_step()
+        # Smooth cosine ramp: 0 → 1 over the first ramp_steps steps
+        t = min(1.0, self._step_count / self._ramp_steps)
+        ramp = float(0.5 * (1.0 - math.cos(math.pi * t)))
+        self._step_count += 1
+
+        self._lax_friedrichs_step(ramp)
         self._apply_limiters()
-        self._apply_bc_inflow()
+        self._apply_bc_inflow(ramp)
         self._apply_bc_outflow()
         self._apply_bc_walls()
         self._swap()
@@ -119,12 +128,13 @@ class SWESolver:
     def get_frame_data(self) -> dict:
         self._compute_derived()
         return {
-            "h": self.h.to_numpy(),
-            "vx": self.vx.to_numpy(),
-            "vy": self.vy.to_numpy(),
-            "speed": self.speed.to_numpy(),
+            "h":         self.h.to_numpy(),
+            "eta":       self.h.to_numpy() + self.b.to_numpy(),
+            "vx":        self.vx.to_numpy(),
+            "vy":        self.vy.to_numpy(),
+            "speed":     self.speed.to_numpy(),
             "vorticity": self.vorticity.to_numpy(),
-            "pressure": self.pressure.to_numpy(),
+            "pressure":  self.pressure.to_numpy(),
         }
 
     # ------------------------------------------------------------------ #
@@ -159,7 +169,7 @@ class SWESolver:
     #  main Lax-Friedrichs step with η-gradient                            #
     # ------------------------------------------------------------------ #
     @ti.kernel
-    def _lax_friedrichs_step(self):
+    def _lax_friedrichs_step(self, ramp: ti.f32):
         g  = self.g
         dx = self.dx
         dy = self.dy
@@ -259,7 +269,7 @@ class SWESolver:
             if r > 0.0:
                 r = r * r * 0.5       # quadratic ramp, strong damping
                 h_val  = (1.0 - r) * h_val  + r * h0
-                hu_val = (1.0 - r) * hu_val + r * h0 * self.u0_val
+                hu_val = (1.0 - r) * hu_val + r * h0 * self.u0_val * ramp
                 hv_val = (1.0 - r) * hv_val
                 self.h_new[i, j] = h_val
 
@@ -302,12 +312,12 @@ class SWESolver:
     #  boundary conditions (split to avoid corner race)                    #
     # ------------------------------------------------------------------ #
     @ti.kernel
-    def _apply_bc_inflow(self):
+    def _apply_bc_inflow(self, ramp: ti.f32):
         h0 = self.h0_val
         u0 = self.u0_val
         for j in range(self.ny):
             self.h_new[0, j]  = h0
-            self.hu_new[0, j] = h0 * u0
+            self.hu_new[0, j] = h0 * u0 * ramp
             self.hv_new[0, j] = 0.0
 
     @ti.kernel
@@ -368,231 +378,6 @@ class SWESolver:
             if 0 < i < nx - 1 and 0 < j < ny - 1:
                 dvdx = (self.vy[i+1, j] - self.vy[i-1, j]) / (2.0 * dx)
                 dudy = (self.vx[i, j+1] - self.vx[i, j-1]) / (2.0 * dy)
-                self.vorticity[i, j] = dvdx - dudy
-            else:
-                self.vorticity[i, j] = 0.0
-
-
-@ti.data_oriented
-class SWESolverLBM:
-    """Shallow-water solver using a D2Q9 Lattice Boltzmann method.
-
-    This is a simplified shallow-water LBM. Bed elevation is treated as
-    solid for cells where b >= h0, and depth is initialized as h0 - b.
-    """
-
-    def __init__(self, nx: int, ny: int, dx: float, dy: float,
-                 dt: float, g: float, nu: float, h0: float, u0: float):
-        self.nx, self.ny = nx, ny
-        self.dx, self.dy = dx, dy
-        self.dt = dt
-        self.g = g
-        self.nu = nu
-        self.h0_val = h0
-        self.u0_val = u0
-
-        # macroscopic fields
-        self.h = ti.field(dtype=ti.f32, shape=(nx, ny))
-        self.u = ti.field(dtype=ti.f32, shape=(nx, ny))
-        self.v = ti.field(dtype=ti.f32, shape=(nx, ny))
-
-        # bed and solid mask
-        self.b = ti.field(dtype=ti.f32, shape=(nx, ny))
-        self.solid = ti.field(dtype=ti.i32, shape=(nx, ny))
-
-        # distribution functions (D2Q9)
-        self.f = ti.field(dtype=ti.f32, shape=(9, nx, ny))
-        self.f_new = ti.field(dtype=ti.f32, shape=(9, nx, ny))
-
-        # derived (diagnostic) quantities
-        self.vx = ti.field(dtype=ti.f32, shape=(nx, ny))
-        self.vy = ti.field(dtype=ti.f32, shape=(nx, ny))
-        self.speed = ti.field(dtype=ti.f32, shape=(nx, ny))
-        self.vorticity = ti.field(dtype=ti.f32, shape=(nx, ny))
-        self.pressure = ti.field(dtype=ti.f32, shape=(nx, ny))
-
-        # lattice parameters
-        self.c = dx / dt
-        self.cs2 = (self.c * self.c) / 3.0
-        self.tau = self.nu / (self.cs2 * self.dt) + 0.5
-
-    # ------------------------------------------------------------------ #
-    #  public helpers                                                      #
-    # ------------------------------------------------------------------ #
-    def set_bed(self, b_np: np.ndarray):
-        self.b.from_numpy(b_np.astype(np.float32))
-        self._update_solid_mask()
-
-    def initialize(self):
-        self._initialize_fields()
-        self._initialize_distributions()
-
-    def step(self):
-        self._collide_and_stream()
-        self._macroscopic()
-
-    def get_frame_data(self) -> dict:
-        self._compute_derived()
-        return {
-            "h": self.h.to_numpy(),
-            "vx": self.vx.to_numpy(),
-            "vy": self.vy.to_numpy(),
-            "speed": self.speed.to_numpy(),
-            "vorticity": self.vorticity.to_numpy(),
-            "pressure": self.pressure.to_numpy(),
-        }
-
-    # ------------------------------------------------------------------ #
-    #  initialization                                                      #
-    # ------------------------------------------------------------------ #
-    @ti.kernel
-    def _update_solid_mask(self):
-        h0 = self.h0_val
-        for i, j in self.b:
-            self.solid[i, j] = 1 if self.b[i, j] >= h0 else 0
-
-    @ti.kernel
-    def _initialize_fields(self):
-        h0 = self.h0_val
-        u0 = self.u0_val
-        for i, j in self.h:
-            if self.solid[i, j] == 1:
-                self.h[i, j] = 0.0
-                self.u[i, j] = 0.0
-                self.v[i, j] = 0.0
-            else:
-                depth = h0 - self.b[i, j]
-                if depth < 0.0:
-                    depth = 0.0
-                self.h[i, j] = depth
-                self.u[i, j] = u0
-                self.v[i, j] = 0.0
-
-    @ti.kernel
-    def _initialize_distributions(self):
-        cs2 = self.cs2
-        for i, j in self.h:
-            h_val = self.h[i, j]
-            u = self.u[i, j]
-            v = self.v[i, j]
-            u2 = u * u + v * v
-            for q in ti.static(range(9)):
-                cx = _CXS[q]
-                cy = _CYS[q]
-                eu = cx * u + cy * v
-                feq = _WTS[q] * h_val * (1.0 + eu / cs2 + 0.5 * (eu * eu) / (cs2 * cs2) - 0.5 * u2 / cs2)
-                self.f[q, i, j] = feq
-
-    # ------------------------------------------------------------------ #
-    #  LBM step                                                            #
-    # ------------------------------------------------------------------ #
-    @ti.kernel
-    def _collide_and_stream(self):
-        cs2 = self.cs2
-        tau = self.tau
-        nx = self.nx
-        ny = self.ny
-
-        for i, j in self.h:
-            if self.solid[i, j] == 1:
-                # bounce-back for solid nodes
-                for q in ti.static(range(9)):
-                    oq = ti.static((0, 3, 4, 1, 2, 7, 8, 5, 6))[q]
-                    self.f_new[q, i, j] = self.f[oq, i, j]
-                continue
-
-            # macroscopic
-            h_val = 0.0
-            u_val = 0.0
-            v_val = 0.0
-            for q in ti.static(range(9)):
-                fqi = self.f[q, i, j]
-                h_val += fqi
-                u_val += fqi * _CXS[q]
-                v_val += fqi * _CYS[q]
-            if h_val > DRY_THRESH:
-                u_val = (u_val / h_val) * self.c
-                v_val = (v_val / h_val) * self.c
-            else:
-                u_val = 0.0
-                v_val = 0.0
-
-            self.h[i, j] = h_val
-            self.u[i, j] = u_val
-            self.v[i, j] = v_val
-
-            u2 = u_val * u_val + v_val * v_val
-
-            # collision and streaming
-            for q in ti.static(range(9)):
-                cx = _CXS[q]
-                cy = _CYS[q]
-                eu = cx * u_val + cy * v_val
-                feq = _WTS[q] * h_val * (1.0 + eu / cs2 + 0.5 * (eu * eu) / (cs2 * cs2) - 0.5 * u2 / cs2)
-                f_post = self.f[q, i, j] - (self.f[q, i, j] - feq) / tau
-
-                ni = i + cx
-                nj = j + cy
-                if 0 <= ni < nx and 0 <= nj < ny:
-                    self.f_new[q, ni, nj] = f_post
-
-        # swap
-        for q, i, j in self.f:
-            self.f[q, i, j] = self.f_new[q, i, j]
-
-    @ti.kernel
-    def _macroscopic(self):
-        for i, j in self.h:
-            if self.solid[i, j] == 1:
-                self.h[i, j] = 0.0
-                self.u[i, j] = 0.0
-                self.v[i, j] = 0.0
-                continue
-            h_val = 0.0
-            u_val = 0.0
-            v_val = 0.0
-            for q in ti.static(range(9)):
-                fqi = self.f[q, i, j]
-                h_val += fqi
-                u_val += fqi * _CXS[q]
-                v_val += fqi * _CYS[q]
-            if h_val > DRY_THRESH:
-                u_val = (u_val / h_val) * self.c
-                v_val = (v_val / h_val) * self.c
-            else:
-                u_val = 0.0
-                v_val = 0.0
-            self.h[i, j] = h_val
-            self.u[i, j] = u_val
-            self.v[i, j] = v_val
-
-    # ------------------------------------------------------------------ #
-    #  derived quantities                                                  #
-    # ------------------------------------------------------------------ #
-    @ti.kernel
-    def _compute_derived(self):
-        g = self.g
-        dx = self.dx
-        dy = self.dy
-        nx = self.nx
-        ny = self.ny
-
-        for i, j in self.h:
-            h_val = self.h[i, j]
-            u = self.u[i, j]
-            v = self.v[i, j]
-            if h_val <= DRY_THRESH:
-                u = 0.0
-                v = 0.0
-            self.vx[i, j] = u
-            self.vy[i, j] = v
-            self.speed[i, j] = ti.sqrt(u * u + v * v)
-            self.pressure[i, j] = 0.5 * g * h_val * h_val
-
-        for i, j in self.vorticity:
-            if 0 < i < nx - 1 and 0 < j < ny - 1:
-                dvdx = (self.vy[i + 1, j] - self.vy[i - 1, j]) / (2.0 * dx)
-                dudy = (self.vx[i, j + 1] - self.vx[i, j - 1]) / (2.0 * dy)
                 self.vorticity[i, j] = dvdx - dudy
             else:
                 self.vorticity[i, j] = 0.0

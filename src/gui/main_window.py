@@ -143,6 +143,7 @@ class MainWindow(QMainWindow):
             "water surface": "surface",
             "glyphs": "glyphs",
             "streamlines": "streamlines",
+            "contours": "contours",
         }
         target = mapping.get(layer, layer)
         self.pipeline.set_layer_visibility(target, visible)

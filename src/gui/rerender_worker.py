@@ -1,7 +1,7 @@
 from PyQt5.QtCore import QObject, pyqtSignal, QThread
 
 from config import SimConfig, DATA_DIR
-from simulation.solver import SWESolver, SWESolverLBM, init_taichi
+from simulation.solver import SWESolver, init_taichi
 from simulation.export import export_frame
 from simulation.obstacles import build_bed_elevation
 
@@ -19,6 +19,7 @@ class RerenderWorker(QObject):
         try:
             self.progress.emit(0)
             init_taichi(self.config.use_gpu)
+            total_steps = self.config.num_frames * self.config.steps_per_frame
             solver = SWESolver(
                 self.config.nx,
                 self.config.ny,
@@ -29,18 +30,9 @@ class RerenderWorker(QObject):
                 self.config.v,
                 self.config.h0,
                 self.config.ux,
+                ramp_steps=total_steps // 10,
             )
-            '''solver = SWESolverLBM(
-                self.config.nx,
-                self.config.ny,
-                self.config.dx,
-                self.config.dy,
-                self.config.dt,
-                self.config.g,
-                self.config.v,
-                self.config.h0,
-                self.config.ux,
-            )'''
+
 
 
             b = build_bed_elevation(self.config, self.obstacles)

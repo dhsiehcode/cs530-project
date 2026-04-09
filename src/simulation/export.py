@@ -17,7 +17,7 @@ def export_frame(frame_data: dict, config: SimConfig,
     image.SetOrigin(0, 0, 0)
 
     # scalar arrays
-    for name in ("h", "vx", "vy", "speed", "vorticity", "pressure"):
+    for name in ("h", "eta", "vx", "vy", "speed", "vorticity", "pressure"):
         arr = numpy_to_vtk(frame_data[name].flatten(order="F").astype(np.float32),
                            deep=True)
         arr.SetName(name)
