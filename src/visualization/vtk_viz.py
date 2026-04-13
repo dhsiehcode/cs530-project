@@ -11,8 +11,11 @@ class VTKPipeline:
     """Manages the full VTK rendering pipeline."""
 
     SCALAR_FIELDS = ("h", "speed", "vorticity")
-    SCALAR_LABELS = {"h": "Height (m)", "speed": "Speed (m/s)",
-                     "vorticity": "Vorticity (1/s)"}
+    SCALAR_LABELS = {
+        "h": "Height (m)",
+        "speed": "Speed (m/s)",
+        "vorticity": "Vorticity (1/s)",
+    }
 
     def __init__(self, config: SimConfig, renderer: vtk.vtkRenderer):
         self.config = config
@@ -21,20 +24,18 @@ class VTKPipeline:
         self.num_frames = 0
         self.active_field = "h"
 
-        # visibility flags
         self.show_surface = True
         self.show_glyphs = True
         self.show_contours = True
         self.show_streamlines = True
 
-        # VTK objects (populated by setup_pipeline)
         self.reader = vtk.vtkXMLImageDataReader()
         self._live_image = None
         self._live_producer = None
         self._live_arrays = {}
         self._live_buffers = {}
         self._live_frame_counter = 0
-        self._source = self.reader          # current pipeline source
+        self._source = self.reader
         self._is_live = False
 
         self.surface_actor = None
@@ -42,42 +43,159 @@ class VTKPipeline:
         self.contour_actor = None
         self.streamline_actor = None
         self.obstacle_actors: list = []
-        self.scalar_bar = None
+        self.scalar_bars = {}
         self.corner_annotation = None
         self._coordinate_picker = vtk.vtkWorldPointPicker()
         self._coordinate_interactor = None
         self._mouse_move_observer = None
         self._last_coordinate_text = "X: --  Y: --"
 
-        # Animation state — when True, expensive filters are skipped
         self._animating = False
-        # Whether streamlines/contours were visible before animation started
-        self._pre_anim_streamlines = True
-        self._pre_anim_contours = True
+        self._obstacles: list[PlacedObstacle] = []
 
-        # color maps
         self._build_color_maps()
-        # estimated scalar ranges – updated after first frame load
-        self.scalar_ranges = {"h": (0.0, 1.0), "speed": (0.0, 1.5),
-                              "vorticity": (-10.0, 10.0)}
+        self.scalar_ranges = {
+            "h": (0.0, 1.0),
+            "speed": (0.0, 1.5),
+            "vorticity": (-10.0, 10.0),
+        }
 
-    # ------------------------------------------------------------------ #
-    #  Source abstraction                                                  #
-    # ------------------------------------------------------------------ #
     def _get_source_port(self):
-        """Return the output port of the current data source."""
         return self._source.GetOutputPort()
 
-    # ------------------------------------------------------------------ #
-    #  Public API                                                         #
-    # ------------------------------------------------------------------ #
-    def load_simulation(self, data_dir: str, num_frames: int,
-                        obstacles: list):
-        """Load a completed simulation and build the pipeline (file mode)."""
+    def _get_current_data(self):
+        return self._live_image if self._is_live else self.reader.GetOutput()
+
+    def _upsert_array(self, point_data, name: str, values: np.ndarray, components: int = 1):
+        arr = point_data.GetArray(name)
+        vtk_values = np.asarray(values, dtype=np.float32)
+        if components > 1:
+            vtk_arr = numpy_to_vtk(vtk_values.reshape(-1, components), deep=True)
+        else:
+            vtk_arr = numpy_to_vtk(vtk_values.reshape(-1), deep=True)
+        vtk_arr.SetName(name)
+
+        if arr is None:
+            point_data.AddArray(vtk_arr)
+            return vtk_arr
+
+        arr.DeepCopy(vtk_arr)
+        arr.Modified()
+        return arr
+
+    def _apply_obstacle_aware_flow(self):
+        data = self._get_current_data()
+        if data is None:
+            return
+
+        pd = data.GetPointData()
+        vx_arr = pd.GetArray("vx")
+        vy_arr = pd.GetArray("vy")
+        if vx_arr is None or vy_arr is None:
+            return
+
+        dims = data.GetDimensions()
+        spacing = data.GetSpacing()
+        origin = data.GetOrigin()
+        nx, ny = dims[0], dims[1]
+        if nx <= 0 or ny <= 0:
+            return
+
+        xs = origin[0] + np.arange(nx, dtype=np.float32) * spacing[0]
+        ys = origin[1] + np.arange(ny, dtype=np.float32) * spacing[1]
+        xx, yy = np.meshgrid(xs, ys, indexing="ij")
+        points = np.column_stack([xx.flatten(order="F"), yy.flatten(order="F")]).astype(np.float32)
+
+        vx = vtk_to_numpy(vx_arr).astype(np.float32, copy=True)
+        vy = vtk_to_numpy(vy_arr).astype(np.float32, copy=True)
+        vec = np.column_stack([vx, vy]).astype(np.float32, copy=False)
+
+        if self._obstacles:
+            shell_pad = max(3.0 * min(self.config.dx, self.config.dy), 0.06)
+
+            def _safe_dir(v: np.ndarray) -> np.ndarray:
+                mag = np.linalg.norm(v, axis=1, keepdims=True)
+                out = np.zeros_like(v)
+                mask = mag[:, 0] > 1.0e-6
+                out[mask] = v[mask] / mag[mask]
+                out[~mask, 0] = 1.0
+                return out
+
+            for obs in self._obstacles:
+                defn = obs.definition
+                center = np.array([obs.x, obs.y], dtype=np.float32)
+
+                if defn.kind == "rock":
+                    closest = np.broadcast_to(center, points.shape)
+                    core_radius = max(defn.radius * 0.95, 0.5 * min(self.config.dx, self.config.dy))
+                    shell_radius = defn.radius + shell_pad
+                else:
+                    angle = np.float32(np.deg2rad(defn.angle))
+                    axis = np.array([np.cos(angle), np.sin(angle)], dtype=np.float32)
+                    half_len = 0.5 * float(defn.length)
+                    a = center - half_len * axis
+                    rel = points - a
+                    t = np.clip(rel @ axis, 0.0, float(defn.length))
+                    closest = a + np.outer(t, axis)
+                    core_radius = max(defn.radius * 1.05, 0.5 * min(self.config.dx, self.config.dy))
+                    shell_radius = defn.radius + shell_pad
+
+                delta = points - closest
+                dist = np.linalg.norm(delta, axis=1)
+                inside_shell = dist < shell_radius
+                if not np.any(inside_shell):
+                    continue
+
+                normal = np.zeros_like(delta, dtype=np.float32)
+                safe_dist = np.maximum(dist, 1.0e-6)
+                normal[inside_shell] = delta[inside_shell] / safe_dist[inside_shell, None]
+
+                tangent = np.column_stack([-normal[:, 1], normal[:, 0]]).astype(np.float32, copy=False)
+                tangent_flip = np.sum(tangent * vec, axis=1) < 0.0
+                tangent[tangent_flip] *= -1.0
+
+                influence = np.clip(
+                    (shell_radius - dist) / max(shell_radius - core_radius, 1.0e-6),
+                    0.0,
+                    1.0,
+                ).astype(np.float32)
+                core = np.clip(
+                    (core_radius - dist) / max(core_radius, 1.0e-6),
+                    0.0,
+                    1.0,
+                ).astype(np.float32)
+
+                inward = np.minimum(np.sum(vec * normal, axis=1), 0.0).astype(np.float32)
+                vec = vec - (influence[:, None] * inward[:, None] * normal)
+
+                speed = np.linalg.norm(vec, axis=1).astype(np.float32)
+                base_dir = _safe_dir(vec)
+                blend = (1.0 - influence)[:, None] * base_dir + influence[:, None] * tangent
+                blend = _safe_dir(blend)
+
+                speed *= (1.0 - 0.995 * core)
+                vec = blend * speed[:, None]
+
+        viz_speed = np.linalg.norm(vec, axis=1).astype(np.float32)
+        viz_velocity = np.column_stack(
+            [vec[:, 0], vec[:, 1], np.zeros(vec.shape[0], dtype=np.float32)]
+        )
+
+        self._upsert_array(pd, "viz_vx", vec[:, 0])
+        self._upsert_array(pd, "viz_vy", vec[:, 1])
+        self._upsert_array(pd, "viz_speed", viz_speed)
+        self._upsert_array(pd, "viz_velocity", viz_velocity, components=3)
+
+        pd.SetActiveScalars("h")
+        pd.SetActiveVectors("velocity")
+        data.Modified()
+
+    def load_simulation(self, data_dir: str, num_frames: int, obstacles: list):
         self._is_live = False
         self._source = self.reader
         self.data_dir = data_dir
         self.num_frames = num_frames
+        self._obstacles = list(obstacles)
 
         self._load_frame(0)
         self._estimate_ranges()
@@ -85,20 +203,16 @@ class VTKPipeline:
         self._add_obstacles(obstacles)
         self._setup_camera()
 
-    # ---- live preview ------------------------------------------------ #
-    def start_live_mode(self, nx: int, ny: int, dx: float, dy: float,
-                        obstacles: list):
-        """Switch pipeline to live data mode at the given resolution."""
+    def start_live_mode(self, nx: int, ny: int, dx: float, dy: float, obstacles: list):
         self._is_live = True
         self._live_frame_counter = 0
+        self._obstacles = list(obstacles)
 
-        # Create an in-memory vtkImageData
         self._live_image = vtk.vtkImageData()
         self._live_image.SetDimensions(nx, ny, 1)
         self._live_image.SetSpacing(dx, dy, 1.0)
         self._live_image.SetOrigin(0, 0, 0)
 
-        # Seed with zeros so the pipeline has valid geometry
         pd = self._live_image.GetPointData()
         n = nx * ny
         self._live_arrays = {}
@@ -114,6 +228,7 @@ class VTKPipeline:
             pd.AddArray(a)
             self._live_arrays[name] = a
             self._live_buffers[name] = vtk_to_numpy(a)
+
         vec = numpy_to_vtk(np.zeros((n, 3), dtype=np.float32), deep=True)
         vec.SetName("velocity")
         pd.AddArray(vec)
@@ -126,16 +241,17 @@ class VTKPipeline:
         self._live_producer.SetOutput(self._live_image)
         self._source = self._live_producer
 
-        # Reasonable default ranges for live mode
-        self.scalar_ranges = {"h": (0.0, 1.0), "speed": (0.0, 2.0),
-                              "vorticity": (-10.0, 10.0)}
+        self.scalar_ranges = {
+            "h": (0.0, 1.0),
+            "speed": (0.0, 2.0),
+            "vorticity": (-10.0, 10.0),
+        }
 
         self._build_pipeline()
         self._add_obstacles(obstacles)
         self._setup_camera()
 
     def update_live_frame(self, frame_data: dict, render: bool = True):
-        """Push new solver output into the live image and optionally re-render."""
         if self._live_image is None:
             return
 
@@ -154,15 +270,11 @@ class VTKPipeline:
         velocity[:, 2] = 0.0
         self._live_arrays["velocity"].Modified()
 
+        self._refresh_active_arrays()
         pd = self._live_image.GetPointData()
-        pd.SetActiveScalars("h")
-        pd.SetActiveVectors("velocity")
-        self._live_image.Modified()
 
         self._live_frame_counter += 1
-        if (self._live_frame_counter %
-                max(1, self.config.live_preview_range_update_interval) == 0):
-            # Adaptive range update — expand ranges to fit data
+        if self._live_frame_counter % max(1, self.config.live_preview_range_update_interval) == 0:
             for name in self.SCALAR_FIELDS:
                 a = pd.GetArray(name)
                 if a:
@@ -172,21 +284,17 @@ class VTKPipeline:
                         mx = max(abs(lo_d), abs(hi_d), abs(lo_c), abs(hi_c), 0.1)
                         self.scalar_ranges[name] = (-mx, mx)
                     else:
-                        self.scalar_ranges[name] = (min(lo_c, lo_d),
-                                                    max(hi_c, hi_d))
+                        self.scalar_ranges[name] = (min(lo_c, lo_d), max(hi_c, hi_d))
 
-            # apply updated range to surface mapper
-            if hasattr(self, "_surface_mapper"):
+            if hasattr(self, "_surface_mapper") and self._surface_mapper:
                 lo, hi = self.scalar_ranges[self.active_field]
                 self._surface_mapper.SetScalarRange(lo, hi)
-            # keep glyph/streamline speed ranges in sync
-            self._sync_speed_ranges()
+            self._sync_ranges()
 
         if render:
             self.renderer.GetRenderWindow().Render()
 
     def stop_live_mode(self):
-        """Tear down the live pipeline."""
         self._is_live = False
         self._live_image = None
         self._live_producer = None
@@ -196,44 +304,18 @@ class VTKPipeline:
         self._source = self.reader
         self.clear()
 
-    # ---- shared API -------------------------------------------------- #
     def set_animating(self, playing: bool):
-        """Toggle animation mode — hides expensive layers during playback.
-
-        vtkStreamTracer and vtkContourFilter re-execute on every pipeline
-        update.  Hiding them during playback prevents the GPU/CPU from
-        recomputing streamlines for every single frame, which is the main
-        cause of playback freezes.
-        """
-        if playing == self._animating:
-            return
         self._animating = playing
-        if playing:
-            # Save current visibility and hide expensive layers
-            if self.streamline_actor:
-                self._pre_anim_streamlines = self.streamline_actor.GetVisibility()
-                self.streamline_actor.SetVisibility(False)
-            if self.contour_actor:
-                self._pre_anim_contours = self.contour_actor.GetVisibility()
-                self.contour_actor.SetVisibility(False)
-        else:
-            # Restore visibility when paused
-            if self.streamline_actor:
-                self.streamline_actor.SetVisibility(self._pre_anim_streamlines)
-            if self.contour_actor:
-                self.contour_actor.SetVisibility(self._pre_anim_contours)
-            # Force a full pipeline update now that we're paused
-            self.renderer.GetRenderWindow().Render()
+        self._update_scalar_bar_visibility()
+        self.renderer.GetRenderWindow().Render()
 
     def set_frame(self, idx: int):
-        """Switch the reader to a different time frame and re-render."""
         if not self._load_frame(idx):
             return
         self._refresh_active_arrays()
         self.renderer.GetRenderWindow().Render()
 
     def set_scalar_field(self, field_name: str):
-        """Change the colour-mapped scalar field on the surface."""
         if field_name not in self.SCALAR_FIELDS:
             return
         self.active_field = field_name
@@ -243,9 +325,9 @@ class VTKPipeline:
         self._surface_mapper.SelectColorArray(field_name)
         self._surface_mapper.SetScalarRange(lo, hi)
         self._surface_mapper.SetLookupTable(self.ctfs[field_name])
-        if self.scalar_bar:
-            self.scalar_bar.SetLookupTable(self.ctfs[field_name])
-            self.scalar_bar.SetTitle(self.SCALAR_LABELS[field_name])
+        if self.scalar_bars.get("surface"):
+            self.scalar_bars["surface"].SetLookupTable(self.ctfs[field_name])
+            self.scalar_bars["surface"].SetTitle(self.SCALAR_LABELS[field_name])
         self.renderer.GetRenderWindow().Render()
 
     def set_layer_visibility(self, layer: str, visible: bool):
@@ -258,10 +340,18 @@ class VTKPipeline:
         actor = actors.get(layer)
         if actor:
             actor.SetVisibility(visible)
+            if layer == "surface":
+                self.show_surface = visible
+            elif layer == "glyphs":
+                self.show_glyphs = visible
+            elif layer == "contours":
+                self.show_contours = visible
+            elif layer == "streamlines":
+                self.show_streamlines = visible
+            self._update_scalar_bar_visibility()
             self.renderer.GetRenderWindow().Render()
 
     def setup_coordinate_display(self, interactor):
-        """Add a corner annotation that tracks mouse world coordinates."""
         if self.corner_annotation is None:
             self.corner_annotation = vtk.vtkCornerAnnotation()
             self.corner_annotation.SetText(2, self._last_coordinate_text)
@@ -287,11 +377,9 @@ class VTKPipeline:
             interactor.GetRenderWindow().Render()
 
         self._coordinate_interactor = interactor
-        self._mouse_move_observer = interactor.AddObserver(
-            "MouseMoveEvent", _on_mouse_move)
+        self._mouse_move_observer = interactor.AddObserver("MouseMoveEvent", _on_mouse_move)
 
     def clear(self):
-        """Remove all actors from the renderer."""
         self.renderer.RemoveAllViewProps()
         self.surface_actor = None
         self.glyph_actor = None
@@ -300,22 +388,21 @@ class VTKPipeline:
         self._riverbed_actor = None
         self._surface_mapper = None
         self._glyph_mapper = None
+        self._contour_mapper = None
         self._streamline_mapper = None
         self.obstacle_actors.clear()
-        self.scalar_bar = None
+        self.scalar_bars = {}
         self.corner_annotation = None
 
     def update_obstacles(self, obstacles: list):
-        """Replace obstacle actors with the given obstacle list."""
+        self._obstacles = list(obstacles)
         for actor in self.obstacle_actors:
             self.renderer.RemoveActor(actor)
         self.obstacle_actors.clear()
         self._add_obstacles(obstacles)
+        self._apply_obstacle_aware_flow()
         self.renderer.GetRenderWindow().Render()
 
-    # ------------------------------------------------------------------ #
-    #  Internal helpers                                                   #
-    # ------------------------------------------------------------------ #
     def _load_frame(self, idx: int) -> bool:
         path = os.path.join(self.data_dir, f"frame_{idx:04d}.vti")
         if not os.path.exists(path):
@@ -326,17 +413,14 @@ class VTKPipeline:
         return True
 
     def _refresh_active_arrays(self):
-        data = self.reader.GetOutput()
+        data = self.reader.GetOutput() if not self._is_live else self._live_image
         if data:
             data.GetPointData().SetActiveScalars("h")
             data.GetPointData().SetActiveVectors("velocity")
+            self._apply_obstacle_aware_flow()
 
     def _estimate_ranges(self):
-        """Scan the first frame to set reasonable colour-map ranges."""
-        if self._is_live:
-            data = self._live_image
-        else:
-            data = self.reader.GetOutput()
+        data = self._live_image if self._is_live else self.reader.GetOutput()
         if not data:
             return
         pd = data.GetPointData()
@@ -350,64 +434,59 @@ class VTKPipeline:
                 elif lo == hi:
                     hi = lo + 1.0
                 self.scalar_ranges[name] = (lo, hi)
-        # Propagate speed range to glyph/streamline mappers
-        self._sync_speed_ranges()
+        self._sync_ranges()
 
-    def _sync_speed_ranges(self):
-        """Push the current speed range to glyph and streamline mappers."""
+    def _sync_ranges(self):
         lo, hi = self.scalar_ranges["speed"]
-        if hasattr(self, "_glyph_mapper") and self._glyph_mapper:
+        if getattr(self, "_glyph_mapper", None):
             self._glyph_mapper.SetScalarRange(lo, hi)
-        if hasattr(self, "_streamline_mapper") and self._streamline_mapper:
+        if getattr(self, "_streamline_mapper", None):
             self._streamline_mapper.SetScalarRange(lo, hi)
+        if getattr(self, "_contour_mapper", None):
+            vlo, vhi = self.scalar_ranges["vorticity"]
+            self._contour_mapper.SetScalarRange(vlo, vhi)
 
-    # ---- colour maps ------------------------------------------------- #
     def _build_color_maps(self):
         self.ctfs = {}
 
-        # height – deep blue (deep) → turquoise → light cyan (shallow peak)
         ctf_h = vtk.vtkColorTransferFunction()
         ctf_h.SetColorSpaceToLab()
-        ctf_h.AddRGBPoint(0.0,  0.02, 0.08, 0.30)   # dark navy
-        ctf_h.AddRGBPoint(0.25, 0.04, 0.18, 0.52)   # ocean blue
-        ctf_h.AddRGBPoint(0.50, 0.06, 0.38, 0.66)   # medium blue
-        ctf_h.AddRGBPoint(0.70, 0.10, 0.58, 0.74)   # teal
-        ctf_h.AddRGBPoint(0.85, 0.25, 0.72, 0.82)   # turquoise
-        ctf_h.AddRGBPoint(1.0,  0.55, 0.88, 0.94)   # light cyan
+        ctf_h.AddRGBPoint(0.0, 0.02, 0.08, 0.30)
+        ctf_h.AddRGBPoint(0.25, 0.04, 0.18, 0.52)
+        ctf_h.AddRGBPoint(0.50, 0.06, 0.38, 0.66)
+        ctf_h.AddRGBPoint(0.70, 0.10, 0.58, 0.74)
+        ctf_h.AddRGBPoint(0.85, 0.25, 0.72, 0.82)
+        ctf_h.AddRGBPoint(1.0, 0.55, 0.88, 0.94)
         self.ctfs["h"] = ctf_h
 
-        # speed – dark blue (still) → cyan → green → yellow → red (fast)
         ctf_s = vtk.vtkColorTransferFunction()
         ctf_s.SetColorSpaceToLab()
-        ctf_s.AddRGBPoint(0.0,  0.05, 0.10, 0.50)   # dark blue (still)
-        ctf_s.AddRGBPoint(0.20, 0.08, 0.40, 0.70)   # blue
-        ctf_s.AddRGBPoint(0.40, 0.10, 0.65, 0.60)   # teal-green
-        ctf_s.AddRGBPoint(0.60, 0.40, 0.80, 0.20)   # green-yellow
-        ctf_s.AddRGBPoint(0.80, 0.90, 0.75, 0.10)   # yellow
-        ctf_s.AddRGBPoint(1.0,  0.85, 0.15, 0.08)   # red (fast)
+        ctf_s.AddRGBPoint(0.0, 0.05, 0.10, 0.50)
+        ctf_s.AddRGBPoint(0.20, 0.08, 0.40, 0.70)
+        ctf_s.AddRGBPoint(0.40, 0.10, 0.65, 0.60)
+        ctf_s.AddRGBPoint(0.60, 0.40, 0.80, 0.20)
+        ctf_s.AddRGBPoint(0.80, 0.90, 0.75, 0.10)
+        ctf_s.AddRGBPoint(1.0, 0.85, 0.15, 0.08)
         self.ctfs["speed"] = ctf_s
 
-        # vorticity – diverging blue-white-red
         ctf_v = vtk.vtkColorTransferFunction()
         ctf_v.SetColorSpaceToDiverging()
         ctf_v.AddRGBPoint(-10.0, 0.231, 0.298, 0.753)
-        ctf_v.AddRGBPoint(0.0,   0.865, 0.865, 0.865)
-        ctf_v.AddRGBPoint(10.0,  0.706, 0.016, 0.150)
+        ctf_v.AddRGBPoint(0.0, 0.865, 0.865, 0.865)
+        ctf_v.AddRGBPoint(10.0, 0.706, 0.016, 0.150)
         self.ctfs["vorticity"] = ctf_v
 
-    # ---- pipeline construction --------------------------------------- #
     def _build_pipeline(self):
         self.clear()
         self._build_riverbed()
         self._build_surface()
-        self._build_glyphs()
         self._build_contours()
+        self._build_glyphs()
         self._build_streamlines()
-        self._build_scalar_bar()
+        self._build_scalar_bars()
         self._setup_lighting()
 
     def _build_riverbed(self):
-        """Flat textured plane at z=0 to give spatial context."""
         w = self.config.domain_width
         h = self.config.domain_height
         plane = vtk.vtkPlaneSource()
@@ -423,29 +502,40 @@ class VTKPipeline:
 
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
-        actor.GetProperty().SetColor(0.58, 0.50, 0.36)   # sandy brown
+        actor.GetProperty().SetColor(0.58, 0.50, 0.36)
         actor.GetProperty().SetAmbient(0.4)
         actor.GetProperty().SetDiffuse(0.6)
 
         self.renderer.AddActor(actor)
         self._riverbed_actor = actor
 
-    def _build_surface(self):
+    def _surface_offset_filter(self, input_port):
         geom = vtk.vtkImageDataGeometryFilter()
-        geom.SetInputConnection(self._get_source_port())
+        geom.SetInputConnection(input_port)
 
-        # Warp by η = h + b (free-surface elevation) so the surface is
-        # physically flat at rest and only real perturbations appear as bumps.
-        assign_eta = vtk.vtkAssignAttribute()
-        assign_eta.SetInputConnection(geom.GetOutputPort())
-        assign_eta.Assign("eta", vtk.vtkDataSetAttributes.SCALARS,
-                          vtk.vtkAssignAttribute.POINT_DATA)
+        calc = vtk.vtkArrayCalculator()
+        calc.SetInputConnection(geom.GetOutputPort())
+        calc.SetAttributeTypeToPointData()
+        calc.AddScalarArrayName("eta", 0)
+        calc.SetResultArrayName("surface_offset")
+        calc.SetFunction(f"eta - {self.config.h0}")
+
+        assign = vtk.vtkAssignAttribute()
+        assign.SetInputConnection(calc.GetOutputPort())
+        assign.Assign(
+            "surface_offset",
+            vtk.vtkDataSetAttributes.SCALARS,
+            vtk.vtkAssignAttribute.POINT_DATA,
+        )
+        return assign
+
+    def _build_surface(self):
+        assign = self._surface_offset_filter(self._get_source_port())
 
         warp = vtk.vtkWarpScalar()
-        warp.SetInputConnection(assign_eta.GetOutputPort())
+        warp.SetInputConnection(assign.GetOutputPort())
         warp.SetScaleFactor(self.config.warp_scale)
 
-        # Normals for proper specular highlights (water sheen)
         normals = vtk.vtkPolyDataNormals()
         normals.SetInputConnection(warp.GetOutputPort())
         normals.SetFeatureAngle(60.0)
@@ -460,69 +550,75 @@ class VTKPipeline:
 
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
+        actor.AddPosition(0, 0, 0.02)
         prop = actor.GetProperty()
-        prop.SetOpacity(0.88)
+        prop.SetOpacity(0.90)
         prop.SetSpecular(0.35)
         prop.SetSpecularPower(40)
         prop.SetSpecularColor(1.0, 1.0, 1.0)
         prop.SetDiffuse(0.7)
-        prop.SetAmbient(0.15)
+        prop.SetAmbient(0.16)
         actor.SetVisibility(self.show_surface)
 
         self.renderer.AddActor(actor)
         self.surface_actor = actor
         self._surface_mapper = mapper
-        self._surface_warp = warp
 
     def _build_glyphs(self):
         sub = vtk.vtkExtractVOI()
         sub.SetInputConnection(self._get_source_port())
-        sample_rate = 48 if self._is_live else 16
+        sample_rate = 40 if self._is_live else 14
         sub.SetSampleRate(sample_rate, sample_rate, 1)
 
-        geom = vtk.vtkImageDataGeometryFilter()
-        geom.SetInputConnection(sub.GetOutputPort())
-
-        assign_eta = vtk.vtkAssignAttribute()
-        assign_eta.SetInputConnection(geom.GetOutputPort())
-        assign_eta.Assign("eta", vtk.vtkDataSetAttributes.SCALARS,
-                          vtk.vtkAssignAttribute.POINT_DATA)
+        assign = self._surface_offset_filter(sub.GetOutputPort())
 
         warp = vtk.vtkWarpScalar()
-        warp.SetInputConnection(assign_eta.GetOutputPort())
+        warp.SetInputConnection(assign.GetOutputPort())
         warp.SetScaleFactor(self.config.warp_scale)
 
         assign_v = vtk.vtkAssignAttribute()
         assign_v.SetInputConnection(warp.GetOutputPort())
-        assign_v.Assign("velocity", vtk.vtkDataSetAttributes.VECTORS,
-                        vtk.vtkAssignAttribute.POINT_DATA)
+        assign_v.Assign(
+            "viz_velocity",
+            vtk.vtkDataSetAttributes.VECTORS,
+            vtk.vtkAssignAttribute.POINT_DATA,
+        )
 
         arrow = vtk.vtkArrowSource()
         arrow.SetTipLength(0.3)
         arrow.SetTipRadius(0.2)
         arrow.SetShaftRadius(0.08)
 
+        glyph_threshold = vtk.vtkThreshold()
+        glyph_threshold.SetInputConnection(assign_v.GetOutputPort())
+        glyph_threshold.SetInputArrayToProcess(
+            0, 0, 0, vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS, "viz_speed"
+        )
+        glyph_threshold.SetLowerThreshold(0.02)
+
+        glyph_geom = vtk.vtkGeometryFilter()
+        glyph_geom.SetInputConnection(glyph_threshold.GetOutputPort())
+
         glyph = vtk.vtkGlyph3D()
-        glyph.SetInputConnection(assign_v.GetOutputPort())
+        glyph.SetInputConnection(glyph_geom.GetOutputPort())
         glyph.SetSourceConnection(arrow.GetOutputPort())
         glyph.SetVectorModeToUseVector()
         glyph.SetScaleModeToScaleByVector()
-        glyph.SetScaleFactor(0.7 if self._is_live else 0.4)
+        glyph.SetScaleFactor(0.75 if self._is_live else 0.45)
         glyph.OrientOn()
 
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(glyph.GetOutputPort())
-        # Color arrows by speed so they show flow intensity
         mapper.SetScalarModeToUsePointFieldData()
-        mapper.SelectColorArray("speed")
+        mapper.SelectColorArray("viz_speed")
         lo, hi = self.scalar_ranges["speed"]
         mapper.SetScalarRange(lo, hi)
         mapper.SetLookupTable(self.ctfs["speed"])
 
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
-        actor.AddPosition(0, 0, self.config.glyph_z_offset)
-        actor.GetProperty().SetOpacity(0.9)
+        actor.AddPosition(0, 0, 0.12)
+        actor.GetProperty().SetOpacity(1.0)
         actor.SetVisibility(self.show_glyphs)
 
         self.renderer.AddActor(actor)
@@ -533,21 +629,21 @@ class VTKPipeline:
         contour = vtk.vtkContourFilter()
         contour.SetInputConnection(self._get_source_port())
         contour.SetInputArrayToProcess(
-            0, 0, 0, vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS, "vorticity")
+            0, 0, 0, vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS, "vorticity"
+        )
         lo, hi = self.scalar_ranges["vorticity"]
         contour.GenerateValues(8 if self._is_live else 12, lo, hi)
 
-        z_offset = self.config.h0 * self.config.warp_scale + 0.15
         transform = vtk.vtkTransform()
-        transform.Translate(0, 0, z_offset)
+        transform.Translate(0, 0, 0.07)
         tf = vtk.vtkTransformPolyDataFilter()
         tf.SetInputConnection(contour.GetOutputPort())
         tf.SetTransform(transform)
 
         tube = vtk.vtkTubeFilter()
         tube.SetInputConnection(tf.GetOutputPort())
-        tube.SetRadius(0.035 if self._is_live else 0.02)
-        tube.SetNumberOfSides(6)
+        tube.SetRadius(0.03 if self._is_live else 0.018)
+        tube.SetNumberOfSides(8)
 
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(tube.GetOutputPort())
@@ -556,93 +652,125 @@ class VTKPipeline:
 
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
-        actor.AddPosition(0, 0, self.config.contour_z_offset)
-        actor.GetProperty().SetOpacity(0.85 if self._is_live else 0.75)
+        actor.GetProperty().SetOpacity(0.95)
         actor.SetVisibility(self.show_contours)
 
         self.renderer.AddActor(actor)
         self.contour_actor = actor
+        self._contour_mapper = mapper
 
     def _build_streamlines(self):
         assign_v = vtk.vtkAssignAttribute()
         assign_v.SetInputConnection(self._get_source_port())
-        assign_v.Assign("velocity", vtk.vtkDataSetAttributes.VECTORS,
-                        vtk.vtkAssignAttribute.POINT_DATA)
+        assign_v.Assign(
+            "viz_velocity",
+            vtk.vtkDataSetAttributes.VECTORS,
+            vtk.vtkAssignAttribute.POINT_DATA,
+        )
 
+        y0 = self.config.dy
+        y1 = self.config.domain_height - self.config.dy
+
+        # Seed across the full inlet height, slightly inside the domain.
         seeds = vtk.vtkLineSource()
-        seeds.SetPoint1(self.config.dx * 2, self.config.dy * 5, 0)
-        seeds.SetPoint2(self.config.dx * 2,
-                        self.config.domain_height - self.config.dy * 5, 0)
-        seeds.SetResolution(8 if self._is_live else 12)
+        seeds.SetPoint1(self.config.dx * 1.5, y0, 0.0)
+        seeds.SetPoint2(self.config.dx * 1.5, y1, 0.0)
+        seeds.SetResolution(36 if self._is_live else 56)
 
         tracer = vtk.vtkStreamTracer()
         tracer.SetInputConnection(assign_v.GetOutputPort())
         tracer.SetSourceConnection(seeds.GetOutputPort())
-        tracer.SetMaximumPropagation(
-            self.config.domain_width if self._is_live else self.config.domain_width * 1.5)
+        tracer.SetMaximumPropagation(self.config.domain_width * 3.0)
         tracer.SetIntegrationDirectionToForward()
         tracer.SetIntegratorTypeToRungeKutta4()
-        tracer.SetMaximumNumberOfSteps(800 if self._is_live else 2000)
+        tracer.SetInitialIntegrationStep(self.config.dx * 0.4)
+        tracer.SetMinimumIntegrationStep(self.config.dx * 0.05)
+        tracer.SetMaximumIntegrationStep(self.config.dx * 1.2)
+        tracer.SetMaximumNumberOfSteps(4000 if self._is_live else 9000)
+        tracer.SetTerminalSpeed(1.0e-6)
+        tracer.SetComputeVorticity(False)
 
-        z_offset = self.config.h0 * self.config.warp_scale + 0.25
         transform = vtk.vtkTransform()
-        transform.Translate(0, 0, z_offset)
+        transform.Translate(0, 0, 0.17)
         tf = vtk.vtkTransformPolyDataFilter()
         tf.SetInputConnection(tracer.GetOutputPort())
         tf.SetTransform(transform)
 
         tube = vtk.vtkTubeFilter()
         tube.SetInputConnection(tf.GetOutputPort())
-        tube.SetRadius(0.035 if self._is_live else 0.025)
-        tube.SetNumberOfSides(6)
+        tube.SetRadius(0.032 if self._is_live else 0.022)
+        tube.SetNumberOfSides(8)
+        tube.CappingOn()
 
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(tube.GetOutputPort())
-        # Color streamlines by speed to show flow acceleration
         mapper.SetScalarModeToUsePointFieldData()
-        mapper.SelectColorArray("speed")
-        lo, hi = self.scalar_ranges["speed"]
-        mapper.SetScalarRange(lo, hi)
+        mapper.SelectColorArray("IntegrationTime")
+        mapper.SetScalarRange(0.0, self.config.domain_width * 3.0)
         mapper.SetLookupTable(self.ctfs["speed"])
 
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
-        actor.AddPosition(0, 0, self.config.streamline_z_offset)
-        actor.GetProperty().SetOpacity(0.85 if self._is_live else 0.75)
+        actor.GetProperty().SetOpacity(1.0)
         actor.SetVisibility(self.show_streamlines)
 
         self.renderer.AddActor(actor)
         self.streamline_actor = actor
         self._streamline_mapper = mapper
 
-    def _build_scalar_bar(self):
+    def _make_scalar_bar(self, title, lookup_table, x, y, h):
         bar = vtk.vtkScalarBarActor()
-        bar.SetLookupTable(self.ctfs[self.active_field])
-        bar.SetTitle(self.SCALAR_LABELS[self.active_field])
-        bar.SetNumberOfLabels(5)
-        bar.SetWidth(0.08)
-        bar.SetHeight(0.4)
-        bar.SetPosition(0.90, 0.05)
-        bar.GetTitleTextProperty().SetFontSize(12)
+        bar.SetLookupTable(lookup_table)
+        bar.SetTitle(title)
+        bar.SetNumberOfLabels(4)
+        bar.SetWidth(0.07)
+        bar.SetHeight(h)
+        bar.SetPosition(x, y)
+        bar.GetTitleTextProperty().SetFontSize(11)
         bar.GetTitleTextProperty().SetColor(1, 1, 1)
         bar.GetLabelTextProperty().SetColor(1, 1, 1)
+        return bar
 
-        self.renderer.AddActor2D(bar)
-        self.scalar_bar = bar
+    def _build_scalar_bars(self):
+        surface_bar = self._make_scalar_bar(
+            self.SCALAR_LABELS[self.active_field],
+            self.ctfs[self.active_field],
+            0.91,
+            0.05,
+            0.28,
+        )
+        glyph_bar = self._make_scalar_bar("Glyph Speed", self.ctfs["speed"], 0.01, 0.67, 0.24)
+        streamline_bar = self._make_scalar_bar("Streamline Speed", self.ctfs["speed"], 0.01, 0.38, 0.24)
+        contour_bar = self._make_scalar_bar("Vorticity", self.ctfs["vorticity"], 0.01, 0.09, 0.24)
 
-    # ---- obstacle actors --------------------------------------------- #
+        for bar in (surface_bar, glyph_bar, streamline_bar, contour_bar):
+            self.renderer.AddActor2D(bar)
+
+        self.scalar_bars = {
+            "surface": surface_bar,
+            "glyphs": glyph_bar,
+            "streamlines": streamline_bar,
+            "contours": contour_bar,
+        }
+        self._update_scalar_bar_visibility()
+
+    def _update_scalar_bar_visibility(self):
+        if not self.scalar_bars:
+            return
+        self.scalar_bars["surface"].SetVisibility(self.show_surface)
+        self.scalar_bars["glyphs"].SetVisibility(self.show_glyphs)
+        self.scalar_bars["streamlines"].SetVisibility(self.show_streamlines)
+        self.scalar_bars["contours"].SetVisibility(self.show_contours)
+
     def _add_obstacles(self, obstacles: list):
         for obs in obstacles:
             actor = create_obstacle_actor(obs, self.config.warp_scale)
             self.renderer.AddActor(actor)
             self.obstacle_actors.append(actor)
 
-    # ---- lighting ---------------------------------------------------- #
     def _setup_lighting(self):
-        """Add a key light and fill light for realistic water sheen."""
         self.renderer.RemoveAllLights()
 
-        # Key light — high angle from upstream-right, warm white
         key = vtk.vtkLight()
         key.SetLightTypeToSceneLight()
         w = self.config.domain_width
@@ -653,7 +781,6 @@ class VTKPipeline:
         key.SetIntensity(1.0)
         self.renderer.AddLight(key)
 
-        # Fill light — soft from opposite side, cool tint
         fill = vtk.vtkLight()
         fill.SetLightTypeToSceneLight()
         fill.SetPosition(w * 0.8, h * 1.5, h * 0.8)
@@ -662,17 +789,14 @@ class VTKPipeline:
         fill.SetIntensity(0.4)
         self.renderer.AddLight(fill)
 
-    # ---- camera ------------------------------------------------------ #
     def _setup_camera(self):
         w = self.config.domain_width
         h = self.config.domain_height
         cam = self.renderer.GetActiveCamera()
-        # View from slightly upstream, elevated — like standing on a bridge
-        cam.SetPosition(w * 0.25, -h * 0.7, h * 1.1)
-        cam.SetFocalPoint(w * 0.55, h / 2, 0)
+        cam.SetPosition(w * 0.28, -h * 0.78, h * 0.92)
+        cam.SetFocalPoint(w * 0.55, h / 2, 0.10)
         cam.SetViewUp(0, 0, 1)
         self.renderer.ResetCamera()
-        # Gradient background: dark blue-grey at bottom, lighter at top
         self.renderer.SetBackground(0.12, 0.14, 0.22)
         self.renderer.SetBackground2(0.28, 0.35, 0.50)
         self.renderer.GradientBackgroundOn()

@@ -1,10 +1,11 @@
+import glob
 import os
+
 import vtk
-from PyQt5.QtWidgets import (
-    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout
-)
 from PyQt5.QtCore import QThread
+from PyQt5.QtWidgets import QHBoxLayout, QMainWindow, QVBoxLayout, QWidget
 from vtk.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
+
 from gui.sidebar_panel import SidebarPanel
 from gui.bottombar_panel import BottomControlBar
 from gui.rerender_worker import RerenderWorker
@@ -18,7 +19,6 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("SWE Visualization")
         self.config = config
 
-        # -------- Widgets --------
         self.sidebar = SidebarPanel(config=self.config)
         self.bottom_bar = BottomControlBar()
         self.vtk_widget = QVTKRenderWindowInteractor()
@@ -28,8 +28,9 @@ class MainWindow(QMainWindow):
         self.vtk_widget.Start()
 
         self.pipeline = VTKPipeline(self.config, self.renderer)
+        self.thread = None
+        self.worker = None
 
-        # -------- Layout --------
         center = QWidget()
         main_v = QVBoxLayout(center)
 
@@ -42,7 +43,6 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(center)
 
-        # -------- Signals --------
         self.bottom_bar.rerender_requested.connect(self.start_rerender)
         self.bottom_bar.frame_changed.connect(self.on_frame_changed)
         self.bottom_bar.playback_toggled.connect(self.on_playback_toggled)
@@ -53,15 +53,22 @@ class MainWindow(QMainWindow):
 
         self._init_vtk_scene()
 
+    def _count_saved_frames(self) -> int:
+        pattern = os.path.join(DATA_DIR, "frame_*.vti")
+        return len(glob.glob(pattern))
+
     def _init_vtk_scene(self):
-        has_frames = os.path.exists(os.path.join(DATA_DIR, "frame_0000.vti"))
-        if has_frames:
+        self.bottom_bar.pause()
+        saved_frames = self._count_saved_frames()
+
+        if saved_frames > 0:
             self.pipeline.load_simulation(
                 DATA_DIR,
-                self.config.num_frames,
+                saved_frames,
                 self.sidebar.placed_obstacles,
             )
-            self.bottom_bar.slider.setRange(0, self.config.num_frames - 1)
+            self.bottom_bar.configure_timeline(saved_frames, self.config.export_interval)
+            self.bottom_bar.set_playback_enabled(saved_frames > 1)
         else:
             self.pipeline.start_live_mode(
                 self.config.live_preview_nx,
@@ -70,12 +77,15 @@ class MainWindow(QMainWindow):
                 self.config.dy,
                 self.sidebar.placed_obstacles,
             )
-            self.bottom_bar.slider.setRange(0, self.bottom_bar.MAX_FRAMES - 1)
+            self.bottom_bar.configure_timeline(1, self.config.export_interval)
+            self.bottom_bar.set_playback_enabled(False)
 
+        self.bottom_bar.set_frame(0, emit_signal=False)
         self.pipeline.setup_coordinate_display(self.vtk_widget)
         self.vtk_widget.GetRenderWindow().Render()
 
     def start_rerender(self):
+        self.bottom_bar.pause()
         self.bottom_bar.set_controls_enabled(False)
         self.bottom_bar.show_progress()
 
@@ -107,21 +117,13 @@ class MainWindow(QMainWindow):
         self.bottom_bar.show_error(msg)
         self.bottom_bar.set_controls_enabled(True)
 
-    # --------------------------------------------------
-    # Obstacle validation feedback
-    # --------------------------------------------------
-
     def validate_obstacle(self, obstacle, x, y):
         if not self.is_legal_position(obstacle, x, y):
             self.bottom_bar.show_error("Illegal obstacle placement")
 
     def is_legal_position(self, obstacle, x, y):
-        # Your validation logic
         return True
 
-    # --------------------------------------------------
-    # VTK pipeline callbacks
-    # --------------------------------------------------
     def on_frame_changed(self, idx: int):
         self.pipeline.set_frame(idx)
 
