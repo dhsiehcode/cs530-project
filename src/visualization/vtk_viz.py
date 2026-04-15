@@ -8,7 +8,7 @@ from simulation.obstacles import create_obstacle_actor
 
 
 class VTKPipeline:
-    """Manages the full VTK rendering pipeline."""
+    """Manages the VTK rendering pipeline for the SWE visualization."""
 
     SCALAR_FIELDS = ("h", "speed", "vorticity")
     SCALAR_LABELS = {
@@ -25,9 +25,9 @@ class VTKPipeline:
         self.active_field = "h"
 
         self.show_surface = True
-        self.show_glyphs = True
+        self.show_particles = True
+        self.show_particle_trails = True
         self.show_contours = True
-        self.show_streamlines = True
 
         self.reader = vtk.vtkXMLImageDataReader()
         self._live_image = None
@@ -39,9 +39,9 @@ class VTKPipeline:
         self._is_live = False
 
         self.surface_actor = None
-        self.glyph_actor = None
+        self.particle_actor = None
+        self.particle_trail_actor = None
         self.contour_actor = None
-        self.streamline_actor = None
         self.obstacle_actors: list = []
         self.scalar_bars = {}
         self.corner_annotation = None
@@ -52,6 +52,20 @@ class VTKPipeline:
 
         self._animating = False
         self._obstacles: list[PlacedObstacle] = []
+
+        self._riverbed_actor = None
+        self._surface_mapper = None
+        self._particle_mapper = None
+        self._particle_trail_mapper = None
+        self._contour_mapper = None
+        self._particle_poly = None
+        self._particle_speed_array = None
+        self._particle_trail_poly = None
+        self._particle_trail_speed_array = None
+        self._particle_seed_pool = np.empty((0, 2), dtype=np.float32)
+        self._particle_positions = None
+        self._particle_speeds = None
+        self._particle_respawns = None
 
         self._build_color_maps()
         self.scalar_ranges = {
@@ -177,9 +191,9 @@ class VTKPipeline:
                 vec = blend * speed[:, None]
 
         viz_speed = np.linalg.norm(vec, axis=1).astype(np.float32)
-        viz_velocity = np.column_stack(
-            [vec[:, 0], vec[:, 1], np.zeros(vec.shape[0], dtype=np.float32)]
-        )
+        viz_velocity = np.column_stack([
+            vec[:, 0], vec[:, 1], np.zeros(vec.shape[0], dtype=np.float32)
+        ])
 
         self._upsert_array(pd, "viz_vx", vec[:, 0])
         self._upsert_array(pd, "viz_vy", vec[:, 1])
@@ -199,14 +213,22 @@ class VTKPipeline:
 
         self._load_frame(0)
         self._estimate_ranges()
+        self._precompute_particle_history()
+        self._load_frame(0)
+        self._refresh_active_arrays()
         self._build_pipeline()
         self._add_obstacles(obstacles)
         self._setup_camera()
+        self._update_particle_visuals(0)
 
     def start_live_mode(self, nx: int, ny: int, dx: float, dy: float, obstacles: list):
         self._is_live = True
         self._live_frame_counter = 0
         self._obstacles = list(obstacles)
+        self._particle_positions = None
+        self._particle_speeds = None
+        self._particle_respawns = None
+        self._particle_seed_pool = self._build_particle_seed_pool()
 
         self._live_image = vtk.vtkImageData()
         self._live_image.SetDimensions(nx, ny, 1)
@@ -223,11 +245,11 @@ class VTKPipeline:
                 self.config.h0 if name in ("h", "eta") else 0.0,
                 dtype=np.float32,
             )
-            a = numpy_to_vtk(buffer, deep=True)
-            a.SetName(name)
-            pd.AddArray(a)
-            self._live_arrays[name] = a
-            self._live_buffers[name] = vtk_to_numpy(a)
+            arr = numpy_to_vtk(buffer, deep=True)
+            arr.SetName(name)
+            pd.AddArray(arr)
+            self._live_arrays[name] = arr
+            self._live_buffers[name] = vtk_to_numpy(arr)
 
         vec = numpy_to_vtk(np.zeros((n, 3), dtype=np.float32), deep=True)
         vec.SetName("velocity")
@@ -250,6 +272,7 @@ class VTKPipeline:
         self._build_pipeline()
         self._add_obstacles(obstacles)
         self._setup_camera()
+        self._update_particle_visuals(0)
 
     def update_live_frame(self, frame_data: dict, render: bool = True):
         if self._live_image is None:
@@ -276,21 +299,21 @@ class VTKPipeline:
         self._live_frame_counter += 1
         if self._live_frame_counter % max(1, self.config.live_preview_range_update_interval) == 0:
             for name in self.SCALAR_FIELDS:
-                a = pd.GetArray(name)
-                if a:
-                    lo_d, hi_d = a.GetRange()
+                arr = pd.GetArray(name)
+                if arr:
+                    lo_d, hi_d = arr.GetRange()
                     lo_c, hi_c = self.scalar_ranges[name]
                     if name == "vorticity":
                         mx = max(abs(lo_d), abs(hi_d), abs(lo_c), abs(hi_c), 0.1)
                         self.scalar_ranges[name] = (-mx, mx)
                     else:
                         self.scalar_ranges[name] = (min(lo_c, lo_d), max(hi_c, hi_d))
-
-            if hasattr(self, "_surface_mapper") and self._surface_mapper:
+            if self._surface_mapper:
                 lo, hi = self.scalar_ranges[self.active_field]
                 self._surface_mapper.SetScalarRange(lo, hi)
             self._sync_ranges()
 
+        self._update_particle_visuals(0)
         if render:
             self.renderer.GetRenderWindow().Render()
 
@@ -313,14 +336,13 @@ class VTKPipeline:
         if not self._load_frame(idx):
             return
         self._refresh_active_arrays()
+        self._update_particle_visuals(idx)
         self.renderer.GetRenderWindow().Render()
 
     def set_scalar_field(self, field_name: str):
-        if field_name not in self.SCALAR_FIELDS:
+        if field_name not in self.SCALAR_FIELDS or not self._surface_mapper:
             return
         self.active_field = field_name
-        if not hasattr(self, "_surface_mapper"):
-            return
         lo, hi = self.scalar_ranges[field_name]
         self._surface_mapper.SelectColorArray(field_name)
         self._surface_mapper.SetScalarRange(lo, hi)
@@ -333,21 +355,21 @@ class VTKPipeline:
     def set_layer_visibility(self, layer: str, visible: bool):
         actors = {
             "surface": self.surface_actor,
-            "glyphs": self.glyph_actor,
+            "particles": self.particle_actor,
+            "particle_trails": self.particle_trail_actor,
             "contours": self.contour_actor,
-            "streamlines": self.streamline_actor,
         }
         actor = actors.get(layer)
-        if actor:
+        if actor is not None:
             actor.SetVisibility(visible)
             if layer == "surface":
                 self.show_surface = visible
-            elif layer == "glyphs":
-                self.show_glyphs = visible
+            elif layer == "particles":
+                self.show_particles = visible
+            elif layer == "particle_trails":
+                self.show_particle_trails = visible
             elif layer == "contours":
                 self.show_contours = visible
-            elif layer == "streamlines":
-                self.show_streamlines = visible
             self._update_scalar_bar_visibility()
             self.renderer.GetRenderWindow().Render()
 
@@ -365,7 +387,7 @@ class VTKPipeline:
         if self._coordinate_interactor and self._mouse_move_observer is not None:
             self._coordinate_interactor.RemoveObserver(self._mouse_move_observer)
 
-        def _on_mouse_move(obj, event):
+        def _on_mouse_move(_obj, _event):
             x, y = interactor.GetEventPosition()
             self._coordinate_picker.Pick(x, y, 0, self.renderer)
             pos = self._coordinate_picker.GetPickPosition()
@@ -382,25 +404,43 @@ class VTKPipeline:
     def clear(self):
         self.renderer.RemoveAllViewProps()
         self.surface_actor = None
-        self.glyph_actor = None
+        self.particle_actor = None
+        self.particle_trail_actor = None
         self.contour_actor = None
-        self.streamline_actor = None
         self._riverbed_actor = None
         self._surface_mapper = None
-        self._glyph_mapper = None
+        self._particle_mapper = None
+        self._particle_trail_mapper = None
         self._contour_mapper = None
-        self._streamline_mapper = None
         self.obstacle_actors.clear()
         self.scalar_bars = {}
         self.corner_annotation = None
+        self._particle_poly = None
+        self._particle_speed_array = None
+        self._particle_trail_poly = None
+        self._particle_trail_speed_array = None
 
     def update_obstacles(self, obstacles: list):
         self._obstacles = list(obstacles)
+        current_frame = 0
+        if not self._is_live:
+            file_name = self.reader.GetFileName() or ""
+            try:
+                current_frame = int(os.path.basename(file_name).split("_")[1].split(".")[0])
+            except Exception:
+                current_frame = 0
+            self._precompute_particle_history()
+            self._load_frame(current_frame)
+            self._refresh_active_arrays()
+        else:
+            self._particle_seed_pool = self._build_particle_seed_pool()
+
         for actor in self.obstacle_actors:
             self.renderer.RemoveActor(actor)
         self.obstacle_actors.clear()
         self._add_obstacles(obstacles)
         self._apply_obstacle_aware_flow()
+        self._update_particle_visuals(current_frame)
         self.renderer.GetRenderWindow().Render()
 
     def _load_frame(self, idx: int) -> bool:
@@ -438,11 +478,11 @@ class VTKPipeline:
 
     def _sync_ranges(self):
         lo, hi = self.scalar_ranges["speed"]
-        if getattr(self, "_glyph_mapper", None):
-            self._glyph_mapper.SetScalarRange(lo, hi)
-        if getattr(self, "_streamline_mapper", None):
-            self._streamline_mapper.SetScalarRange(lo, hi)
-        if getattr(self, "_contour_mapper", None):
+        if self._particle_mapper:
+            self._particle_mapper.SetScalarRange(lo, hi)
+        if self._particle_trail_mapper:
+            self._particle_trail_mapper.SetScalarRange(lo, hi)
+        if self._contour_mapper:
             vlo, vhi = self.scalar_ranges["vorticity"]
             self._contour_mapper.SetScalarRange(vlo, vhi)
 
@@ -481,8 +521,8 @@ class VTKPipeline:
         self._build_riverbed()
         self._build_surface()
         self._build_contours()
-        self._build_glyphs()
-        self._build_streamlines()
+        self._build_particles()
+        self._build_particle_trails()
         self._build_scalar_bars()
         self._setup_lighting()
 
@@ -564,66 +604,82 @@ class VTKPipeline:
         self.surface_actor = actor
         self._surface_mapper = mapper
 
-    def _build_glyphs(self):
-        sub = vtk.vtkExtractVOI()
-        sub.SetInputConnection(self._get_source_port())
-        sample_rate = 40 if self._is_live else 14
-        sub.SetSampleRate(sample_rate, sample_rate, 1)
+    def _build_particles(self):
+        self._particle_poly = vtk.vtkPolyData()
+        points = vtk.vtkPoints()
+        points.SetNumberOfPoints(0)
+        self._particle_poly.SetPoints(points)
 
-        assign = self._surface_offset_filter(sub.GetOutputPort())
+        verts = vtk.vtkCellArray()
+        self._particle_poly.SetVerts(verts)
 
-        warp = vtk.vtkWarpScalar()
-        warp.SetInputConnection(assign.GetOutputPort())
-        warp.SetScaleFactor(self.config.warp_scale)
+        self._particle_speed_array = vtk.vtkFloatArray()
+        self._particle_speed_array.SetName("particle_speed")
+        self._particle_poly.GetPointData().AddArray(self._particle_speed_array)
+        self._particle_poly.GetPointData().SetActiveScalars("particle_speed")
 
-        assign_v = vtk.vtkAssignAttribute()
-        assign_v.SetInputConnection(warp.GetOutputPort())
-        assign_v.Assign(
-            "viz_velocity",
-            vtk.vtkDataSetAttributes.VECTORS,
-            vtk.vtkAssignAttribute.POINT_DATA,
-        )
-
-        arrow = vtk.vtkArrowSource()
-        arrow.SetTipLength(0.3)
-        arrow.SetTipRadius(0.2)
-        arrow.SetShaftRadius(0.08)
-
-        glyph_threshold = vtk.vtkThreshold()
-        glyph_threshold.SetInputConnection(assign_v.GetOutputPort())
-        glyph_threshold.SetInputArrayToProcess(
-            0, 0, 0, vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS, "viz_speed"
-        )
-        glyph_threshold.SetLowerThreshold(0.02)
-
-        glyph_geom = vtk.vtkGeometryFilter()
-        glyph_geom.SetInputConnection(glyph_threshold.GetOutputPort())
+        sphere = vtk.vtkSphereSource()
+        sphere.SetRadius(self.config.particle_radius)
+        sphere.SetThetaResolution(12)
+        sphere.SetPhiResolution(12)
 
         glyph = vtk.vtkGlyph3D()
-        glyph.SetInputConnection(glyph_geom.GetOutputPort())
-        glyph.SetSourceConnection(arrow.GetOutputPort())
-        glyph.SetVectorModeToUseVector()
-        glyph.SetScaleModeToScaleByVector()
-        glyph.SetScaleFactor(0.75 if self._is_live else 0.45)
-        glyph.OrientOn()
+        glyph.SetInputData(self._particle_poly)
+        glyph.SetSourceConnection(sphere.GetOutputPort())
+        glyph.ScalingOff()
+        glyph.OrientOff()
 
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(glyph.GetOutputPort())
         mapper.SetScalarModeToUsePointFieldData()
-        mapper.SelectColorArray("viz_speed")
+        mapper.SelectColorArray("particle_speed")
         lo, hi = self.scalar_ranges["speed"]
         mapper.SetScalarRange(lo, hi)
         mapper.SetLookupTable(self.ctfs["speed"])
 
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
-        actor.AddPosition(0, 0, 0.12)
-        actor.GetProperty().SetOpacity(1.0)
-        actor.SetVisibility(self.show_glyphs)
+        actor.AddPosition(0, 0, self.config.particle_z_offset)
+        actor.GetProperty().SetOpacity(0.95)
+        actor.SetVisibility(self.show_particles)
 
         self.renderer.AddActor(actor)
-        self.glyph_actor = actor
-        self._glyph_mapper = mapper
+        self.particle_actor = actor
+        self._particle_mapper = mapper
+
+    def _build_particle_trails(self):
+        self._particle_trail_poly = vtk.vtkPolyData()
+        self._particle_trail_poly.SetPoints(vtk.vtkPoints())
+        self._particle_trail_poly.SetLines(vtk.vtkCellArray())
+
+        self._particle_trail_speed_array = vtk.vtkFloatArray()
+        self._particle_trail_speed_array.SetName("particle_speed")
+        self._particle_trail_poly.GetPointData().AddArray(self._particle_trail_speed_array)
+        self._particle_trail_poly.GetPointData().SetActiveScalars("particle_speed")
+
+        tube = vtk.vtkTubeFilter()
+        tube.SetInputData(self._particle_trail_poly)
+        tube.SetRadius(self.config.particle_trail_radius)
+        tube.SetNumberOfSides(10)
+        tube.CappingOff()
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(tube.GetOutputPort())
+        mapper.SetScalarModeToUsePointFieldData()
+        mapper.SelectColorArray("particle_speed")
+        lo, hi = self.scalar_ranges["speed"]
+        mapper.SetScalarRange(lo, hi)
+        mapper.SetLookupTable(self.ctfs["speed"])
+
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.AddPosition(0, 0, self.config.particle_trail_z_offset)
+        actor.GetProperty().SetOpacity(0.90)
+        actor.SetVisibility(self.show_particle_trails)
+
+        self.renderer.AddActor(actor)
+        self.particle_trail_actor = actor
+        self._particle_trail_mapper = mapper
 
     def _build_contours(self):
         contour = vtk.vtkContourFilter()
@@ -631,23 +687,31 @@ class VTKPipeline:
         contour.SetInputArrayToProcess(
             0, 0, 0, vtk.vtkDataObject.FIELD_ASSOCIATION_POINTS, "vorticity"
         )
+
         lo, hi = self.scalar_ranges["vorticity"]
-        contour.GenerateValues(8 if self._is_live else 12, lo, hi)
+        mag = max(abs(lo), abs(hi), 0.1)
+        levels = np.array([-0.85, -0.60, -0.35, 0.35, 0.60, 0.85], dtype=np.float32) * mag
+        contour.SetNumberOfContours(len(levels))
+        for idx, value in enumerate(levels):
+            contour.SetValue(idx, float(value))
 
         transform = vtk.vtkTransform()
-        transform.Translate(0, 0, 0.07)
+        transform.Translate(0, 0, self.config.contour_z_offset)
         tf = vtk.vtkTransformPolyDataFilter()
         tf.SetInputConnection(contour.GetOutputPort())
         tf.SetTransform(transform)
 
         tube = vtk.vtkTubeFilter()
         tube.SetInputConnection(tf.GetOutputPort())
-        tube.SetRadius(0.03 if self._is_live else 0.018)
-        tube.SetNumberOfSides(8)
+        tube.SetRadius(0.026 if self._is_live else 0.016)
+        tube.SetNumberOfSides(10)
+        tube.CappingOn()
 
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(tube.GetOutputPort())
-        mapper.SetScalarRange(lo, hi)
+        mapper.SetScalarModeToUsePointFieldData()
+        mapper.SelectColorArray("vorticity")
+        mapper.SetScalarRange(-mag, mag)
         mapper.SetLookupTable(self.ctfs["vorticity"])
 
         actor = vtk.vtkActor()
@@ -658,65 +722,6 @@ class VTKPipeline:
         self.renderer.AddActor(actor)
         self.contour_actor = actor
         self._contour_mapper = mapper
-
-    def _build_streamlines(self):
-        assign_v = vtk.vtkAssignAttribute()
-        assign_v.SetInputConnection(self._get_source_port())
-        assign_v.Assign(
-            "viz_velocity",
-            vtk.vtkDataSetAttributes.VECTORS,
-            vtk.vtkAssignAttribute.POINT_DATA,
-        )
-
-        y0 = self.config.dy
-        y1 = self.config.domain_height - self.config.dy
-
-        # Seed across the full inlet height, slightly inside the domain.
-        seeds = vtk.vtkLineSource()
-        seeds.SetPoint1(self.config.dx * 1.5, y0, 0.0)
-        seeds.SetPoint2(self.config.dx * 1.5, y1, 0.0)
-        seeds.SetResolution(36 if self._is_live else 56)
-
-        tracer = vtk.vtkStreamTracer()
-        tracer.SetInputConnection(assign_v.GetOutputPort())
-        tracer.SetSourceConnection(seeds.GetOutputPort())
-        tracer.SetMaximumPropagation(self.config.domain_width * 3.0)
-        tracer.SetIntegrationDirectionToForward()
-        tracer.SetIntegratorTypeToRungeKutta4()
-        tracer.SetInitialIntegrationStep(self.config.dx * 0.4)
-        tracer.SetMinimumIntegrationStep(self.config.dx * 0.05)
-        tracer.SetMaximumIntegrationStep(self.config.dx * 1.2)
-        tracer.SetMaximumNumberOfSteps(4000 if self._is_live else 9000)
-        tracer.SetTerminalSpeed(1.0e-6)
-        tracer.SetComputeVorticity(False)
-
-        transform = vtk.vtkTransform()
-        transform.Translate(0, 0, 0.17)
-        tf = vtk.vtkTransformPolyDataFilter()
-        tf.SetInputConnection(tracer.GetOutputPort())
-        tf.SetTransform(transform)
-
-        tube = vtk.vtkTubeFilter()
-        tube.SetInputConnection(tf.GetOutputPort())
-        tube.SetRadius(0.032 if self._is_live else 0.022)
-        tube.SetNumberOfSides(8)
-        tube.CappingOn()
-
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputConnection(tube.GetOutputPort())
-        mapper.SetScalarModeToUsePointFieldData()
-        mapper.SelectColorArray("IntegrationTime")
-        mapper.SetScalarRange(0.0, self.config.domain_width * 3.0)
-        mapper.SetLookupTable(self.ctfs["speed"])
-
-        actor = vtk.vtkActor()
-        actor.SetMapper(mapper)
-        actor.GetProperty().SetOpacity(1.0)
-        actor.SetVisibility(self.show_streamlines)
-
-        self.renderer.AddActor(actor)
-        self.streamline_actor = actor
-        self._streamline_mapper = mapper
 
     def _make_scalar_bar(self, title, lookup_table, x, y, h):
         bar = vtk.vtkScalarBarActor()
@@ -739,17 +744,17 @@ class VTKPipeline:
             0.05,
             0.28,
         )
-        glyph_bar = self._make_scalar_bar("Glyph Speed", self.ctfs["speed"], 0.01, 0.67, 0.24)
-        streamline_bar = self._make_scalar_bar("Streamline Speed", self.ctfs["speed"], 0.01, 0.38, 0.24)
+        particle_bar = self._make_scalar_bar("Particle Speed", self.ctfs["speed"], 0.01, 0.67, 0.24)
+        trail_bar = self._make_scalar_bar("Trail Speed", self.ctfs["speed"], 0.01, 0.38, 0.24)
         contour_bar = self._make_scalar_bar("Vorticity", self.ctfs["vorticity"], 0.01, 0.09, 0.24)
 
-        for bar in (surface_bar, glyph_bar, streamline_bar, contour_bar):
+        for bar in (surface_bar, particle_bar, trail_bar, contour_bar):
             self.renderer.AddActor2D(bar)
 
         self.scalar_bars = {
             "surface": surface_bar,
-            "glyphs": glyph_bar,
-            "streamlines": streamline_bar,
+            "particles": particle_bar,
+            "particle_trails": trail_bar,
             "contours": contour_bar,
         }
         self._update_scalar_bar_visibility()
@@ -758,8 +763,8 @@ class VTKPipeline:
         if not self.scalar_bars:
             return
         self.scalar_bars["surface"].SetVisibility(self.show_surface)
-        self.scalar_bars["glyphs"].SetVisibility(self.show_glyphs)
-        self.scalar_bars["streamlines"].SetVisibility(self.show_streamlines)
+        self.scalar_bars["particles"].SetVisibility(self.show_particles)
+        self.scalar_bars["particle_trails"].SetVisibility(self.show_particle_trails)
         self.scalar_bars["contours"].SetVisibility(self.show_contours)
 
     def _add_obstacles(self, obstacles: list):
@@ -800,3 +805,261 @@ class VTKPipeline:
         self.renderer.SetBackground(0.12, 0.14, 0.22)
         self.renderer.SetBackground2(0.28, 0.35, 0.50)
         self.renderer.GradientBackgroundOn()
+
+    def _build_particle_seed_pool(self) -> np.ndarray:
+        x_inlet = self.config.dx * 1.5
+        y_min = self.config.dy * 2.0
+        y_max = self.config.domain_height - self.config.dy * 2.0
+
+        seeds = []
+        inlet_count = max(8, int(self.config.particle_inlet_seed_count))
+        for y in np.linspace(y_min, y_max, inlet_count, dtype=np.float32):
+            seeds.append([x_inlet, y])
+
+        focus_count = int(self.config.particle_focus_seed_count)
+        if self._obstacles and focus_count > 0:
+            per_obs = max(8, focus_count // len(self._obstacles))
+            for obs in self._obstacles:
+                defn = obs.definition
+                upstream = max(
+                    x_inlet,
+                    obs.x - max(self.config.particle_focus_upstream_offset, 1.5 * defn.radius),
+                )
+                span = max(
+                    self.config.particle_focus_half_height,
+                    2.0 * defn.radius if defn.kind == "rock" else 2.0 * defn.radius + 0.25 * defn.length,
+                )
+                ys = np.linspace(
+                    max(y_min, obs.y - span),
+                    min(y_max, obs.y + span),
+                    per_obs,
+                    dtype=np.float32,
+                )
+                for y in ys:
+                    seeds.append([upstream, y])
+
+        if not seeds:
+            return np.empty((0, 2), dtype=np.float32)
+
+        seed_pool = np.asarray(seeds, dtype=np.float32)
+        seed_pool[:, 0] = np.clip(seed_pool[:, 0], x_inlet, self.config.domain_width - self.config.dx * 2.0)
+        seed_pool[:, 1] = np.clip(seed_pool[:, 1], y_min, y_max)
+        return seed_pool
+
+    def _points_inside_obstacles(self, points: np.ndarray) -> np.ndarray:
+        if points.size == 0 or not self._obstacles:
+            return np.zeros(points.shape[0], dtype=bool)
+
+        inside = np.zeros(points.shape[0], dtype=bool)
+        for obs in self._obstacles:
+            defn = obs.definition
+            center = np.array([obs.x, obs.y], dtype=np.float32)
+            if defn.kind == "rock":
+                dist = np.linalg.norm(points - center, axis=1)
+                inside |= dist <= max(defn.radius * 0.95, min(self.config.dx, self.config.dy))
+            else:
+                angle = np.deg2rad(defn.angle)
+                axis = np.array([np.cos(angle), np.sin(angle)], dtype=np.float32)
+                half_len = 0.5 * defn.length
+                a = center - half_len * axis
+                rel = points - a
+                t = np.clip(rel @ axis, 0.0, defn.length)
+                closest = a + np.outer(t, axis)
+                dist = np.linalg.norm(points - closest, axis=1)
+                inside |= dist <= max(defn.radius * 1.02, min(self.config.dx, self.config.dy))
+        return inside
+
+    def _sample_velocity(self, data, positions: np.ndarray) -> np.ndarray:
+        if positions.size == 0 or data is None:
+            return np.zeros((0, 2), dtype=np.float32)
+
+        pd = data.GetPointData()
+        vx_arr = pd.GetArray("viz_vx") or pd.GetArray("vx")
+        vy_arr = pd.GetArray("viz_vy") or pd.GetArray("vy")
+        if vx_arr is None or vy_arr is None:
+            return np.zeros((positions.shape[0], 2), dtype=np.float32)
+
+        dims = data.GetDimensions()
+        nx, ny = dims[0], dims[1]
+        if nx < 2 or ny < 2:
+            return np.zeros((positions.shape[0], 2), dtype=np.float32)
+
+        origin = data.GetOrigin()
+        spacing = data.GetSpacing()
+        fx = (positions[:, 0] - origin[0]) / max(spacing[0], 1.0e-6)
+        fy = (positions[:, 1] - origin[1]) / max(spacing[1], 1.0e-6)
+
+        fx = np.clip(fx, 0.0, nx - 1.001)
+        fy = np.clip(fy, 0.0, ny - 1.001)
+
+        i0 = np.floor(fx).astype(np.int32)
+        j0 = np.floor(fy).astype(np.int32)
+        i1 = np.clip(i0 + 1, 0, nx - 1)
+        j1 = np.clip(j0 + 1, 0, ny - 1)
+        tx = (fx - i0).astype(np.float32)
+        ty = (fy - j0).astype(np.float32)
+
+        vx = vtk_to_numpy(vx_arr).reshape((nx, ny), order="F").astype(np.float32, copy=False)
+        vy = vtk_to_numpy(vy_arr).reshape((nx, ny), order="F").astype(np.float32, copy=False)
+
+        def interp(field):
+            f00 = field[i0, j0]
+            f10 = field[i1, j0]
+            f01 = field[i0, j1]
+            f11 = field[i1, j1]
+            return (
+                (1.0 - tx) * (1.0 - ty) * f00
+                + tx * (1.0 - ty) * f10
+                + (1.0 - tx) * ty * f01
+                + tx * ty * f11
+            )
+
+        return np.column_stack([interp(vx), interp(vy)]).astype(np.float32)
+
+    def _precompute_particle_history(self):
+        self._particle_seed_pool = self._build_particle_seed_pool()
+        if self._particle_seed_pool.size == 0 or self.num_frames <= 0:
+            self._particle_positions = np.zeros((0, 0, 2), dtype=np.float32)
+            self._particle_speeds = np.zeros((0, 0), dtype=np.float32)
+            self._particle_respawns = np.zeros((0, 0), dtype=bool)
+            return
+
+        n_particles = self._particle_seed_pool.shape[0]
+        positions = self._particle_seed_pool.copy()
+        rng = np.random.default_rng(20260414)
+
+        history = np.zeros((self.num_frames, n_particles, 2), dtype=np.float32)
+        speeds = np.zeros((self.num_frames, n_particles), dtype=np.float32)
+        respawns = np.zeros((self.num_frames, n_particles), dtype=bool)
+
+        dt = float(self.config.export_interval)
+        x_min = self.config.dx * 1.0
+        x_max = self.config.domain_width - self.config.dx * 1.0
+        y_min = self.config.dy * 1.0
+        y_max = self.config.domain_height - self.config.dy * 1.0
+
+        for frame_idx in range(self.num_frames):
+            if not self._load_frame(frame_idx):
+                break
+            data = self.reader.GetOutput()
+            history[frame_idx] = positions
+
+            k1 = self._sample_velocity(data, positions)
+            mid = positions + 0.5 * dt * k1
+            mid[:, 0] = np.clip(mid[:, 0], x_min, x_max)
+            mid[:, 1] = np.clip(mid[:, 1], y_min, y_max)
+            k2 = self._sample_velocity(data, mid)
+            speeds[frame_idx] = np.linalg.norm(k2, axis=1).astype(np.float32)
+
+            next_positions = positions + dt * k2
+            outside = (
+                (next_positions[:, 0] < x_min)
+                | (next_positions[:, 0] > x_max)
+                | (next_positions[:, 1] < y_min)
+                | (next_positions[:, 1] > y_max)
+            )
+            inside = self._points_inside_obstacles(next_positions)
+            stalled = speeds[frame_idx] < self.config.particle_respawn_speed_threshold
+            respawn_mask = outside | inside | (stalled & (frame_idx > 2))
+
+            next_positions[:, 0] = np.clip(next_positions[:, 0], x_min, x_max)
+            next_positions[:, 1] = np.clip(next_positions[:, 1], y_min, y_max)
+
+            if np.any(respawn_mask):
+                seed_idx = rng.integers(0, self._particle_seed_pool.shape[0], size=int(respawn_mask.sum()))
+                next_positions[respawn_mask] = self._particle_seed_pool[seed_idx]
+                if frame_idx + 1 < self.num_frames:
+                    respawns[frame_idx + 1, respawn_mask] = True
+
+            positions = next_positions.astype(np.float32, copy=False)
+
+        self._particle_positions = history
+        self._particle_speeds = speeds
+        self._particle_respawns = respawns
+
+    def _update_particle_visuals(self, frame_idx: int):
+        if self._particle_poly is None or self._particle_trail_poly is None:
+            return
+
+        if self._is_live or self._particle_positions is None or self._particle_positions.size == 0:
+            points_xy = self._particle_seed_pool
+            point_speeds = np.zeros(points_xy.shape[0], dtype=np.float32)
+            respawns = None
+        else:
+            frame_idx = int(np.clip(frame_idx, 0, self._particle_positions.shape[0] - 1))
+            points_xy = self._particle_positions[frame_idx]
+            point_speeds = self._particle_speeds[frame_idx]
+            respawns = self._particle_respawns
+
+        particle_points = vtk.vtkPoints()
+        particle_verts = vtk.vtkCellArray()
+        particle_speeds = vtk.vtkFloatArray()
+        particle_speeds.SetName("particle_speed")
+
+        for idx, (xy, speed) in enumerate(zip(points_xy, point_speeds)):
+            pid = particle_points.InsertNextPoint(float(xy[0]), float(xy[1]), 0.0)
+            particle_verts.InsertNextCell(1)
+            particle_verts.InsertCellPoint(pid)
+            particle_speeds.InsertNextValue(float(speed))
+
+        self._particle_poly.SetPoints(particle_points)
+        self._particle_poly.SetVerts(particle_verts)
+        pd = self._particle_poly.GetPointData()
+        existing = pd.GetArray("particle_speed")
+        if existing is None:
+            pd.AddArray(particle_speeds)
+        else:
+            existing.DeepCopy(particle_speeds)
+            existing.Modified()
+        pd.SetActiveScalars("particle_speed")
+        self._particle_poly.Modified()
+
+        trail_points = vtk.vtkPoints()
+        trail_lines = vtk.vtkCellArray()
+        trail_speeds = vtk.vtkFloatArray()
+        trail_speeds.SetName("particle_speed")
+
+        if not self._is_live and self._particle_positions is not None and self._particle_positions.size > 0:
+            start_frame = max(0, frame_idx - self.config.particle_trail_length + 1)
+            jump_thresh = self.config.particle_respawn_jump_threshold
+
+            for particle_idx in range(self._particle_positions.shape[1]):
+                current_segment = []
+                for t in range(start_frame, frame_idx + 1):
+                    if respawns is not None and respawns[t, particle_idx] and current_segment:
+                        self._append_trail_segment(current_segment, trail_points, trail_lines, trail_speeds)
+                        current_segment = []
+
+                    xy = self._particle_positions[t, particle_idx]
+                    current_segment.append((float(xy[0]), float(xy[1]), 0.0, float(self._particle_speeds[t, particle_idx])))
+
+                    if t < frame_idx:
+                        nxt = self._particle_positions[t + 1, particle_idx]
+                        jump = np.linalg.norm(nxt - xy)
+                        if jump > jump_thresh:
+                            self._append_trail_segment(current_segment, trail_points, trail_lines, trail_speeds)
+                            current_segment = []
+                self._append_trail_segment(current_segment, trail_points, trail_lines, trail_speeds)
+
+        self._particle_trail_poly.SetPoints(trail_points)
+        self._particle_trail_poly.SetLines(trail_lines)
+        trail_pd = self._particle_trail_poly.GetPointData()
+        existing_trail = trail_pd.GetArray("particle_speed")
+        if existing_trail is None:
+            trail_pd.AddArray(trail_speeds)
+        else:
+            existing_trail.DeepCopy(trail_speeds)
+            existing_trail.Modified()
+        trail_pd.SetActiveScalars("particle_speed")
+        self._particle_trail_poly.Modified()
+
+    def _append_trail_segment(self, segment, points, lines, scalars):
+        if len(segment) < 2:
+            return
+        polyline = vtk.vtkPolyLine()
+        polyline.GetPointIds().SetNumberOfIds(len(segment))
+        for local_idx, (x, y, z, speed) in enumerate(segment):
+            pid = points.InsertNextPoint(x, y, z)
+            polyline.GetPointIds().SetId(local_idx, pid)
+            scalars.InsertNextValue(speed)
+        lines.InsertNextCell(polyline)

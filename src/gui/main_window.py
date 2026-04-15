@@ -33,14 +33,11 @@ class MainWindow(QMainWindow):
 
         center = QWidget()
         main_v = QVBoxLayout(center)
-
         middle = QHBoxLayout()
         middle.addWidget(self.vtk_widget, 1)
         middle.addWidget(self.sidebar)
-
         main_v.addLayout(middle, 1)
         main_v.addWidget(self.bottom_bar)
-
         self.setCentralWidget(center)
 
         self.bottom_bar.rerender_requested.connect(self.start_rerender)
@@ -94,7 +91,6 @@ class MainWindow(QMainWindow):
             config=self.config,
             obstacles=self.sidebar.placed_obstacles,
         )
-
         self.worker.moveToThread(self.thread)
 
         self.thread.started.connect(self.worker.run)
@@ -143,8 +139,8 @@ class MainWindow(QMainWindow):
     def on_layer_toggled(self, layer: str, visible: bool):
         mapping = {
             "water surface": "surface",
-            "glyphs": "glyphs",
-            "streamlines": "streamlines",
+            "particles": "particles",
+            "particle trails": "particle_trails",
             "contours": "contours",
         }
         target = mapping.get(layer, layer)
