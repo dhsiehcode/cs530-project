@@ -66,6 +66,7 @@ class VTKPipeline:
         self._particle_positions = None
         self._particle_speeds = None
         self._particle_respawns = None
+        self._display_voi = None
 
         self._build_color_maps()
         self.scalar_ranges = {
@@ -75,7 +76,23 @@ class VTKPipeline:
         }
 
     def _get_source_port(self):
+        if self._display_voi is not None:
+            return self._display_voi.GetOutputPort()
         return self._source.GetOutputPort()
+
+    def _build_display_voi(self):
+        data = self._get_current_data()
+        if data is None:
+            self._display_voi = None
+            return
+        dims = data.GetDimensions()
+        nx, ny = dims[0], dims[1]
+        buf = max(1, self.config.wall_buffer_cells)
+        voi = vtk.vtkExtractVOI()
+        voi.SetInputConnection(self._source.GetOutputPort())
+        voi.SetVOI(0, nx - 1, buf, ny - 1 - buf, 0, 0)
+        voi.Update()
+        self._display_voi = voi
 
     def _get_current_data(self):
         return self._live_image if self._is_live else self.reader.GetOutput()
@@ -419,6 +436,7 @@ class VTKPipeline:
         self._particle_speed_array = None
         self._particle_trail_poly = None
         self._particle_trail_speed_array = None
+        self._display_voi = None
 
     def update_obstacles(self, obstacles: list):
         self._obstacles = list(obstacles)
@@ -518,6 +536,7 @@ class VTKPipeline:
 
     def _build_pipeline(self):
         self.clear()
+        self._build_display_voi()
         self._build_riverbed()
         self._build_surface()
         self._build_contours()
@@ -808,8 +827,9 @@ class VTKPipeline:
 
     def _build_particle_seed_pool(self) -> np.ndarray:
         x_inlet = self.config.dx * 1.5
-        y_min = self.config.dy * 2.0
-        y_max = self.config.domain_height - self.config.dy * 2.0
+        buf = self.config.wall_buffer_cells * self.config.dy
+        y_min = buf
+        y_max = self.config.domain_height - buf
 
         seeds = []
         inlet_count = max(8, int(self.config.particle_inlet_seed_count))
@@ -935,8 +955,9 @@ class VTKPipeline:
         dt = float(self.config.export_interval)
         x_min = self.config.dx * 1.0
         x_max = self.config.domain_width - self.config.dx * 1.0
-        y_min = self.config.dy * 1.0
-        y_max = self.config.domain_height - self.config.dy * 1.0
+        buf = self.config.wall_buffer_cells * self.config.dy
+        y_min = buf
+        y_max = self.config.domain_height - buf
 
         for frame_idx in range(self.num_frames):
             if not self._load_frame(frame_idx):
@@ -996,7 +1017,7 @@ class VTKPipeline:
         particle_speeds = vtk.vtkFloatArray()
         particle_speeds.SetName("particle_speed")
 
-        for idx, (xy, speed) in enumerate(zip(points_xy, point_speeds)):
+        for xy, speed in zip(points_xy, point_speeds):
             pid = particle_points.InsertNextPoint(float(xy[0]), float(xy[1]), 0.0)
             particle_verts.InsertNextCell(1)
             particle_verts.InsertCellPoint(pid)

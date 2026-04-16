@@ -40,6 +40,9 @@ class SimConfig:
     particle_respawn_speed_threshold: float = 0.010
     particle_respawn_jump_threshold: float = 0.45
 
+    # Number of grid cells from each y-boundary to exclude from seeding and display
+    wall_buffer_cells: int = 10
+
     @property
     def num_frames(self) -> int:
         return int(self.sim_time / self.export_interval)
