@@ -59,13 +59,17 @@ class MainWindow(QMainWindow):
         saved_frames = self._count_saved_frames()
 
         if saved_frames > 0:
+            skip_frames = max(0, int(round(1.0 / self.config.export_interval)))
+            skip_frames = min(skip_frames, saved_frames - 1)
             self.pipeline.load_simulation(
                 DATA_DIR,
                 saved_frames,
                 self.sidebar.placed_obstacles,
             )
-            self.bottom_bar.configure_timeline(saved_frames, self.config.export_interval)
-            self.bottom_bar.set_playback_enabled(saved_frames > 1)
+            self.bottom_bar.configure_timeline(
+                saved_frames, self.config.export_interval, min_frame=skip_frames
+            )
+            self.bottom_bar.set_playback_enabled(saved_frames > skip_frames + 1)
         else:
             self.pipeline.start_live_mode(
                 self.config.live_preview_nx,
@@ -77,7 +81,9 @@ class MainWindow(QMainWindow):
             self.bottom_bar.configure_timeline(1, self.config.export_interval)
             self.bottom_bar.set_playback_enabled(False)
 
-        self.bottom_bar.set_frame(0, emit_signal=False)
+        start_frame = self.bottom_bar._min_frame
+        self.pipeline.set_frame(start_frame)
+        self.bottom_bar.set_frame(start_frame, emit_signal=False)
         self.pipeline.setup_coordinate_display(self.vtk_widget)
         self.vtk_widget.GetRenderWindow().Render()
 

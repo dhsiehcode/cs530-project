@@ -155,6 +155,7 @@ class BottomControlBar(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._frame = 0
+        self._min_frame = 0
         self._max_frame = 1
         self._time_per_frame = 0.1
 
@@ -206,16 +207,17 @@ class BottomControlBar(QWidget):
 
         self._update_label()
 
-    def configure_timeline(self, total_frames: int, time_per_frame: float):
+    def configure_timeline(self, total_frames: int, time_per_frame: float, min_frame: int = 0):
         self.pause()
         self._max_frame = max(1, int(total_frames))
+        self._min_frame = max(0, min(int(min_frame), self._max_frame - 1))
         self._time_per_frame = max(0.0, float(time_per_frame))
         self.slider.blockSignals(True)
-        self.slider.setRange(0, self._max_frame - 1)
-        self.slider.setValue(min(self._frame, self._max_frame - 1))
+        self.slider.setRange(self._min_frame, self._max_frame - 1)
+        clamped = max(self._min_frame, min(self._frame, self._max_frame - 1))
+        self.slider.setValue(clamped)
         self.slider.blockSignals(False)
-        if self._frame >= self._max_frame:
-            self._frame = self._max_frame - 1
+        self._frame = clamped
         self._update_label()
 
     def set_playback_enabled(self, enabled: bool):
@@ -233,7 +235,7 @@ class BottomControlBar(QWidget):
             self.pause()
         else:
             if self._frame >= self._max_frame - 1:
-                self.set_frame(0, emit_signal=True)
+                self.set_frame(self._min_frame, emit_signal=True)
             self.timer.start()
             self.play_btn.setText("Pause")
             self.playback_toggled.emit(True)
@@ -260,7 +262,7 @@ class BottomControlBar(QWidget):
             self.playback_toggled.emit(False)
 
     def set_frame(self, frame_idx, emit_signal: bool = True):
-        frame_idx = max(0, min(int(frame_idx), self._max_frame - 1))
+        frame_idx = max(self._min_frame, min(int(frame_idx), self._max_frame - 1))
         changed = frame_idx != self._frame
         self._frame = frame_idx
 
