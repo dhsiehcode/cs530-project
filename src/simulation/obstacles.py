@@ -81,7 +81,7 @@ def create_rock_mesh(
 ) -> vtk.vtkPolyData:
     """Return a vtkPolyData sphere with surface noise (rocky look)."""
     rng = random.Random(seed)
-    r = obs.definition.radius
+    r = obs.definition.radius - SimConfig.dx * 5
 
     sphere = vtk.vtkSphereSource()
     sphere.SetRadius(r)

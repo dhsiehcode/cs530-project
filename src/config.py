@@ -43,7 +43,7 @@ class SimConfig:
     # Number of grid cells from each y-boundary to exclude from seeding and display
     wall_buffer_cells: int = 0
     # Number of grid cells from the x_max (outlet) boundary to clip from display
-    x_max_buffer_cells: int = 40
+    x_max_buffer_cells: int = 45
 
     x_outlet_buffer_cells: int = 5
 
