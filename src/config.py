@@ -47,6 +47,8 @@ class SimConfig:
 
     x_outlet_buffer_cells: int = 5
 
+    log_buffer_cells: int = 1
+    
     @property
     def num_frames(self) -> int:
         return int(self.sim_time / self.export_interval)
@@ -71,7 +73,7 @@ class ObstacleDef:
     radius: float
     height: float
     length: float = 0.0
-    angle: float = 90.0
+    angle: float = 0.0
 
 
 @dataclass

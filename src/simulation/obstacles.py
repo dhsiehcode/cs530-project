@@ -119,15 +119,16 @@ def create_log_mesh(obs: PlacedObstacle, warp_scale: float) -> vtk.vtkPolyData:
     """Return a vtkPolyData cylinder positioned on the river bed."""
     defn = obs.definition
     cyl = vtk.vtkCylinderSource()
-    cyl.SetRadius(defn.radius)
-    cyl.SetHeight(defn.length)
+    cyl.SetRadius(defn.radius + SimConfig.log_buffer_cells * SimConfig.dx)
+    cyl.SetHeight(defn.length +  + SimConfig.log_buffer_cells * SimConfig.dy)
     cyl.SetResolution(16)
     cyl.Update()
 
     transform = vtk.vtkTransform()
     transform.Translate(obs.x, obs.y, defn.radius * 0.5)
     transform.RotateZ(defn.angle)       # rotate in xy-plane
-    transform.RotateX(90)               # lay cylinder on its side
+    #transform.RotateX(90)               # lay cylinder on its side
+    #transform.RotateY(90)  
 
     tf = vtk.vtkTransformPolyDataFilter()
     tf.SetInputConnection(cyl.GetOutputPort())
