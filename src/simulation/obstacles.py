@@ -94,7 +94,7 @@ def create_rock_mesh(
 
     # Transform to world position: place bottom hemisphere at z = 0
     transform = vtk.vtkTransform()
-    transform.Translate(obs.x, obs.y, r * 0.3)  # slightly embedded
+    transform.Translate(obs.x, obs.y, r * 0.3 + SimConfig.h0)  # slightly embedded
     tf = vtk.vtkTransformPolyDataFilter()
     tf.SetInputData(poly)
     tf.SetTransform(transform)
@@ -114,7 +114,7 @@ def create_log_mesh(obs: PlacedObstacle, warp_scale: float) -> vtk.vtkPolyData:
     cyl.Update()
 
     transform = vtk.vtkTransform()
-    transform.Translate(obs.x, obs.y, defn.radius * 0.5)
+    transform.Translate(obs.x, obs.y, defn.radius * 0.5 + SimConfig.h0) ## shift up by h_0 in z?
     transform.RotateZ(defn.angle)   # rotate in xy-plane
 
 

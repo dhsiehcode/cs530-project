@@ -56,6 +56,7 @@ class VTKPipeline:
         self._obstacle_flat_mask = None
 
         self._riverbed_actor = None
+        self._water_body_actor = None
         self._surface_mapper = None
         self._particle_mapper = None
         self._particle_trail_mapper = None
@@ -432,6 +433,7 @@ class VTKPipeline:
         self.particle_trail_actor = None
         self.contour_actor = None
         self._riverbed_actor = None
+        self._water_body_actor = None
         self._surface_mapper = None
         self._particle_mapper = None
         self._particle_trail_mapper = None
@@ -545,6 +547,7 @@ class VTKPipeline:
         self.clear()
         self._build_display_voi()
         self._build_riverbed()
+        self._build_water_body()
         self._build_surface()
         self._build_contours()
         self._build_particles()
@@ -575,6 +578,34 @@ class VTKPipeline:
         self.renderer.AddActor(actor)
         self._riverbed_actor = actor
 
+    def _build_water_body(self):
+        """Solid enclosed cube representing the water volume below the surface."""
+        x0 = self.config.x_outlet_buffer_cells * self.config.dx
+        x1 = self.config.domain_width - self.config.x_max_buffer_cells * self.config.dx
+        y_max = self.config.domain_height
+        wall_h = self.config.warp_scale * self.config.h0
+
+        cube = vtk.vtkCubeSource()
+        cube.SetBounds(x0, x1, 0.0, y_max, 0.0, wall_h)
+        cube.Update()
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(cube.GetOutputPort())
+
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        prop = actor.GetProperty()
+        prop.SetColor(0.06, 0.38, 0.66)
+        prop.SetOpacity(0.90)
+        prop.SetSpecular(0.35)
+        prop.SetSpecularPower(40)
+        prop.SetSpecularColor(1.0, 1.0, 1.0)
+        prop.SetDiffuse(0.7)
+        prop.SetAmbient(0.16)
+
+        self.renderer.AddActor(actor)
+        self._water_body_actor = actor
+
     def _surface_offset_filter(self, input_port):
         geom = vtk.vtkImageDataGeometryFilter()
         geom.SetInputConnection(input_port)
@@ -584,7 +615,8 @@ class VTKPipeline:
         calc.SetAttributeTypeToPointData()
         calc.AddScalarArrayName("eta", 0)
         calc.SetResultArrayName("surface_offset")
-        calc.SetFunction(f"eta - {self.config.h0}")
+        #calc.SetFunction("eta")
+        calc.SetFunction(f"{self.config.h0}")
 
         assign = vtk.vtkAssignAttribute()
         assign.SetInputConnection(calc.GetOutputPort())
@@ -665,7 +697,8 @@ class VTKPipeline:
 
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
-        actor.AddPosition(0, 0, self.config.particle_z_offset)
+        base_z = self.config.warp_scale * self.config.h0
+        actor.AddPosition(0, 0, base_z + self.config.particle_z_offset)
         actor.GetProperty().SetOpacity(0.95)
         actor.SetVisibility(self.show_particles)
 
@@ -699,7 +732,8 @@ class VTKPipeline:
 
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
-        actor.AddPosition(0, 0, self.config.particle_trail_z_offset)
+        base_z = self.config.warp_scale * self.config.h0
+        actor.AddPosition(0, 0, base_z + self.config.particle_trail_z_offset)
         actor.GetProperty().SetOpacity(0.90)
         actor.SetVisibility(self.show_particle_trails)
 
@@ -801,8 +835,9 @@ class VTKPipeline:
         for idx, value in enumerate(levels):
             contour.SetValue(idx, float(value))
 
+        base_z = self.config.warp_scale * self.config.h0
         transform = vtk.vtkTransform()
-        transform.Translate(0, 0, self.config.contour_z_offset)
+        transform.Translate(0, 0, base_z + self.config.contour_z_offset)
         tf = vtk.vtkTransformPolyDataFilter()
         tf.SetInputConnection(contour.GetOutputPort())
         tf.SetTransform(transform)

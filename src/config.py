@@ -8,7 +8,7 @@ class SimConfig:
     ny: int = 128
     dx: float = 0.039
     dy: float = 0.039
-    h0: float = 0.5
+    h0: float = 0.1
     ux: float = 0.5
     uy: float = 0.0
     v: float = 0.011
@@ -85,9 +85,9 @@ class PlacedObstacle:
 
 
 PRECONFIGURED_OBSTACLES = [
-    ObstacleDef("Small Rock", "rock", radius=0.2 * 2, height=0.20),
-    ObstacleDef("Medium Rock", "rock", radius=0.3 * 2, height=0.30),
-    ObstacleDef("Large Rock", "rock", radius=0.5 * 2, height=0.40),
+    ObstacleDef("Small Rock", "rock", radius=0.3 * 2, height=0.30),
+    ObstacleDef("Medium Rock", "rock", radius=0.4 * 2, height=0.40),
+    ObstacleDef("Large Rock", "rock", radius=0.55 * 2, height=0.55),
     ObstacleDef("Small Log", "log", radius=0.15, height=0.40, length=1.5),
     ObstacleDef("Large Log", "log", radius=0.20, height=0.50, length=3.0),
 ]
