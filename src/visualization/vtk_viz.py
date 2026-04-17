@@ -583,7 +583,9 @@ class VTKPipeline:
         x0 = self.config.x_outlet_buffer_cells * self.config.dx
         x1 = self.config.domain_width - self.config.x_max_buffer_cells * self.config.dx
         y_max = self.config.domain_height
-        wall_h = self.config.warp_scale * self.config.h0
+
+        # Keep the water body just below the mean free surface so the ripple reads clearly.
+        wall_h = max(0.0, self.config.warp_scale * self.config.h0 - 0.02)
 
         cube = vtk.vtkCubeSource()
         cube.SetBounds(x0, x1, 0.0, y_max, 0.0, wall_h)
@@ -596,15 +598,16 @@ class VTKPipeline:
         actor.SetMapper(mapper)
         prop = actor.GetProperty()
         prop.SetColor(0.06, 0.38, 0.66)
-        prop.SetOpacity(0.90)
-        prop.SetSpecular(0.35)
-        prop.SetSpecularPower(40)
+        prop.SetOpacity(0.25)
+        prop.SetSpecular(0.20)
+        prop.SetSpecularPower(25)
         prop.SetSpecularColor(1.0, 1.0, 1.0)
         prop.SetDiffuse(0.7)
         prop.SetAmbient(0.16)
 
         self.renderer.AddActor(actor)
         self._water_body_actor = actor
+
 
     def _surface_offset_filter(self, input_port):
         geom = vtk.vtkImageDataGeometryFilter()
@@ -615,8 +618,9 @@ class VTKPipeline:
         calc.SetAttributeTypeToPointData()
         calc.AddScalarArrayName("eta", 0)
         calc.SetResultArrayName("surface_offset")
-        #calc.SetFunction("eta")
-        calc.SetFunction(f"{self.config.h0}")
+
+        # Warp only the deviation from the rest water level, not the full absolute height.
+        calc.SetFunction(f"(eta - {self.config.h0})")
 
         assign = vtk.vtkAssignAttribute()
         assign.SetInputConnection(calc.GetOutputPort())
@@ -627,12 +631,15 @@ class VTKPipeline:
         )
         return assign
 
+
     def _build_surface(self):
         assign = self._surface_offset_filter(self._get_source_port())
 
         warp = vtk.vtkWarpScalar()
         warp.SetInputConnection(assign.GetOutputPort())
-        warp.SetScaleFactor(self.config.warp_scale)
+
+        # Exaggerate only the wave deviation.
+        warp.SetScaleFactor(self.config.warp_scale * 6.0)
 
         normals = vtk.vtkPolyDataNormals()
         normals.SetInputConnection(warp.GetOutputPort())
@@ -648,9 +655,12 @@ class VTKPipeline:
 
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
-        actor.AddPosition(0, 0, 0.02)
+
+        # Place the surface at the mean water level first, then add the amplified ripple.
+        actor.AddPosition(0, 0, self.config.warp_scale * self.config.h0 + 0.02)
+
         prop = actor.GetProperty()
-        prop.SetOpacity(0.90)
+        prop.SetOpacity(0.92)
         prop.SetSpecular(0.35)
         prop.SetSpecularPower(40)
         prop.SetSpecularColor(1.0, 1.0, 1.0)

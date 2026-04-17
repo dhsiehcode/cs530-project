@@ -278,10 +278,22 @@ class SWESolver:
     def _apply_bc_inflow(self, ramp: ti.f32):
         h0 = self.h0_val
         u0 = self.u0_val
+
+        # Short free-surface pulse riding on top of the inflow ramp.
+        pulse = 0.22 * h0 * ti.exp(-((ramp - 0.35) / 0.12) * ((ramp - 0.35) / 0.12))
+
         for j in range(self.ny):
-            self.h_new[0, j] = h0
-            self.hu_new[0, j] = h0 * u0 * ramp
-            self.hv_new[0, j] = 0.0
+            bed = self.b[0, j]
+            if bed < h0:
+                eta_in = h0 + pulse
+                h_in = ti.max(eta_in - bed, DRY_THRESH)
+                self.h_new[0, j] = h_in
+                self.hu_new[0, j] = h_in * u0 * ramp
+                self.hv_new[0, j] = 0.0
+            else:
+                self.h_new[0, j] = 0.0
+                self.hu_new[0, j] = 0.0
+                self.hv_new[0, j] = 0.0
 
     @ti.kernel
     def _apply_bc_outflow(self):
