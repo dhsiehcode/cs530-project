@@ -702,9 +702,68 @@ class VTKPipeline:
         self.particle_trail_actor = actor
         self._particle_trail_mapper = mapper
 
-    def _build_contours(self):
-        #levels = self._compute_contour_levels(self._get_current_data())
+    def _obstacle_local_contour_levels(self, data, global_mag: float, n_local: int = 6) -> np.ndarray:
+        """Return extra contour levels densely packed in the high-vorticity zones near each obstacle."""
+        if not self._obstacles or data is None:
+            return np.empty(0, dtype=np.float32)
 
+        arr = data.GetPointData().GetArray("vorticity")
+        if arr is None:
+            return np.empty(0, dtype=np.float32)
+
+        dims = data.GetDimensions()
+        nx, ny = dims[0], dims[1]
+        origin = data.GetOrigin()
+        spacing = data.GetSpacing()
+
+        xs = origin[0] + np.arange(nx, dtype=np.float32) * spacing[0]
+        ys = origin[1] + np.arange(ny, dtype=np.float32) * spacing[1]
+        xx, yy = np.meshgrid(xs, ys, indexing="ij")
+        pts = np.column_stack([xx.ravel(order="F"), yy.ravel(order="F")])
+        vort = vtk_to_numpy(arr).astype(np.float32)
+
+        extra = []
+        for obs in self._obstacles:
+            defn = obs.definition
+            center = np.array([obs.x, obs.y], dtype=np.float32)
+
+            if defn.kind == "rock":
+                search_r = defn.radius * 4.0
+                dist = np.linalg.norm(pts - center, axis=1)
+                mask = dist <= search_r
+            else:
+                angle = np.deg2rad(defn.angle)
+                axis = np.array([np.cos(angle), np.sin(angle)], dtype=np.float32)
+                half_len = 0.5 * defn.length
+                a = center - half_len * axis
+                rel = pts - a
+                t = np.clip(rel @ axis, 0.0, defn.length)
+                closest = a + np.outer(t, axis)
+                dist = np.linalg.norm(pts - closest, axis=1)
+                search_r = defn.radius * 4.0 + 0.5 * defn.length
+                mask = dist <= search_r
+
+            if mask.sum() < 4:
+                continue
+
+            local_vort = vort[mask]
+            local_mag = float(np.percentile(np.abs(local_vort), 90))
+            local_mag = max(local_mag, global_mag * 0.3)
+
+            # Only add levels that are denser than what the global levels already provide
+            if local_mag <= global_mag * 1.1:
+                continue
+
+            for sign in (-1.0, 1.0):
+                levels = np.linspace(sign * global_mag * 0.25, sign * local_mag, n_local,
+                                     dtype=np.float32)
+                extra.append(levels)
+
+        if not extra:
+            return np.empty(0, dtype=np.float32)
+        return np.concatenate(extra)
+
+    def _build_contours(self):
         contour = vtk.vtkContourFilter()
         contour.SetInputConnection(self._get_source_port())
         contour.SetInputArrayToProcess(
@@ -712,16 +771,26 @@ class VTKPipeline:
         )
 
         lo, hi = self.scalar_ranges["vorticity"]
-        mag = max(abs(lo), abs(hi), 0.1)
+        global_mag = max(abs(lo), abs(hi), 0.1)
         data = self._get_current_data()
         if data is not None:
             arr = data.GetPointData().GetArray("vorticity")
             if arr is not None:
                 values = vtk_to_numpy(arr).astype(np.float32)
-                mag = float(np.percentile(np.abs(values), 95))
-                mag = max(mag, 0.1)
-        levels = np.array([ -0.2, 0.2], dtype=np.float32) * mag
+                global_mag = float(np.percentile(np.abs(values), 95))
+                global_mag = max(global_mag, 0.1)
 
+        # Square-root spacing: denser near zero (weak background rotation),
+        # sparser at the extremes (strong shear). 5 levels per sign = 10 total.
+        #t = np.linspace(0.0, 1.0, 6, dtype=np.float32)[1:]  # skip zero
+        #sqrt_fracs = np.sqrt(t)  # [0.45, 0.63, 0.77, 0.89, 1.0]
+        #sqrt_fracs = [0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.6, 0.7]
+        #pos = sqrt_fracs * global_mag
+        #global_levels = np.concatenate([-pos[::-1], pos])
+        global_levels = np.array([-0.05, -0.1, -0.15, -0.2, -0.3, -0.4, -0.6, -0.7, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.6, 0.7], dtype=np.float32) * global_mag
+        local_levels = self._obstacle_local_contour_levels(data, global_mag)
+
+        levels = np.unique(np.concatenate([global_levels, local_levels]).round(6))
 
         contour.SetNumberOfContours(len(levels))
         for idx, value in enumerate(levels):
@@ -743,8 +812,8 @@ class VTKPipeline:
         mapper.SetInputConnection(tube.GetOutputPort())
         mapper.SetScalarModeToUsePointFieldData()
         mapper.SelectColorArray("vorticity")
-        mag = max(abs(levels).max(), 0.1) if len(levels) > 0 else max(abs(self.scalar_ranges["vorticity"][0]), abs(self.scalar_ranges["vorticity"][1]), 0.1)
-        mapper.SetScalarRange(-mag, mag)
+        full_mag = max(float(np.abs(levels).max()), global_mag, 0.1)
+        mapper.SetScalarRange(-full_mag, full_mag)
         mapper.SetLookupTable(self.ctfs["vorticity"])
 
         actor = vtk.vtkActor()
