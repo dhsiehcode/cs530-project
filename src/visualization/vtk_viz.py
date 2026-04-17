@@ -88,9 +88,11 @@ class VTKPipeline:
         dims = data.GetDimensions()
         nx, ny = dims[0], dims[1]
         buf = max(1, self.config.wall_buffer_cells)
+        x_buf = max(0, self.config.x_max_buffer_cells)
+        outleft_buf = max(0, self.config.x_outlet_buffer_cells)
         voi = vtk.vtkExtractVOI()
         voi.SetInputConnection(self._source.GetOutputPort())
-        voi.SetVOI(0, nx - 1, buf, ny - 1 - buf, 0, 0)
+        voi.SetVOI(outleft_buf, nx - 1 - x_buf, buf, ny - 1 - buf, 0, 0)
         voi.Update()
         self._display_voi = voi
 
@@ -549,9 +551,9 @@ class VTKPipeline:
         w = self.config.domain_width
         h = self.config.domain_height
         plane = vtk.vtkPlaneSource()
-        plane.SetOrigin(0, 0, -0.01)
-        plane.SetPoint1(w, 0, -0.01)
-        plane.SetPoint2(0, h, -0.01)
+        plane.SetOrigin(self.config.x_outlet_buffer_cells * self.config.dx, 0, -0.01)
+        plane.SetPoint1(w - self.config.x_max_buffer_cells * self.config.dx, 0, -0.01)
+        plane.SetPoint2(self.config.x_outlet_buffer_cells * self.config.dx, h, -0.01)
         plane.SetXResolution(1)
         plane.SetYResolution(1)
         plane.Update()
@@ -701,6 +703,8 @@ class VTKPipeline:
         self._particle_trail_mapper = mapper
 
     def _build_contours(self):
+        #levels = self._compute_contour_levels(self._get_current_data())
+
         contour = vtk.vtkContourFilter()
         contour.SetInputConnection(self._get_source_port())
         contour.SetInputArrayToProcess(
@@ -709,7 +713,16 @@ class VTKPipeline:
 
         lo, hi = self.scalar_ranges["vorticity"]
         mag = max(abs(lo), abs(hi), 0.1)
-        levels = np.array([-0.85, -0.60, -0.35, 0.35, 0.60, 0.85], dtype=np.float32) * mag
+        data = self._get_current_data()
+        if data is not None:
+            arr = data.GetPointData().GetArray("vorticity")
+            if arr is not None:
+                values = vtk_to_numpy(arr).astype(np.float32)
+                mag = float(np.percentile(np.abs(values), 95))
+                mag = max(mag, 0.1)
+        levels = np.array([ -0.2, 0.2], dtype=np.float32) * mag
+
+
         contour.SetNumberOfContours(len(levels))
         for idx, value in enumerate(levels):
             contour.SetValue(idx, float(value))
@@ -730,6 +743,7 @@ class VTKPipeline:
         mapper.SetInputConnection(tube.GetOutputPort())
         mapper.SetScalarModeToUsePointFieldData()
         mapper.SelectColorArray("vorticity")
+        mag = max(abs(levels).max(), 0.1) if len(levels) > 0 else max(abs(self.scalar_ranges["vorticity"][0]), abs(self.scalar_ranges["vorticity"][1]), 0.1)
         mapper.SetScalarRange(-mag, mag)
         mapper.SetLookupTable(self.ctfs["vorticity"])
 
@@ -826,7 +840,7 @@ class VTKPipeline:
         self.renderer.GradientBackgroundOn()
 
     def _build_particle_seed_pool(self) -> np.ndarray:
-        x_inlet = self.config.dx * 1.5
+        x_inlet = self.config.dx * 1.5 + self.config.x_outlet_buffer_cells * self.config.dx
         buf = self.config.wall_buffer_cells * self.config.dy
         y_min = buf
         y_max = self.config.domain_height - buf

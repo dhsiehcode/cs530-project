@@ -297,11 +297,11 @@ class SWESolver:
         ny = self.ny
         for i in range(1, nx - 1):
             self.h_new[i, 0] = self.h_new[i, 1]
-            self.hu_new[i, 0] = self.hu_new[i, 1]
+            self.hu_new[i, 0] = -self.hu_new[i, 1]
             self.hv_new[i, 0] = -self.hv_new[i, 1]
         for i in range(1, nx - 1):
             self.h_new[i, ny - 1] = self.h_new[i, ny - 2]
-            self.hu_new[i, ny - 1] = self.hu_new[i, ny - 2]
+            self.hu_new[i, ny - 1] = -self.hu_new[i, ny - 2]
             self.hv_new[i, ny - 1] = -self.hv_new[i, ny - 2]
 
     @ti.kernel

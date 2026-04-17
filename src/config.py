@@ -41,7 +41,11 @@ class SimConfig:
     particle_respawn_jump_threshold: float = 0.45
 
     # Number of grid cells from each y-boundary to exclude from seeding and display
-    wall_buffer_cells: int = 10
+    wall_buffer_cells: int = 0
+    # Number of grid cells from the x_max (outlet) boundary to clip from display
+    x_max_buffer_cells: int = 40
+
+    x_outlet_buffer_cells: int = 5
 
     @property
     def num_frames(self) -> int:
