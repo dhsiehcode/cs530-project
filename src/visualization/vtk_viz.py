@@ -1,3 +1,4 @@
+import math
 import os
 import numpy as np
 import vtk
@@ -52,6 +53,7 @@ class VTKPipeline:
 
         self._animating = False
         self._obstacles: list[PlacedObstacle] = []
+        self._obstacle_flat_mask = None
 
         self._riverbed_actor = None
         self._surface_mapper = None
@@ -163,15 +165,16 @@ class VTKPipeline:
                     core_radius = max(defn.radius * 0.95, 0.5 * min(self.config.dx, self.config.dy))
                     shell_radius = defn.radius + shell_pad
                 else:
-                    angle = np.float32(np.deg2rad(defn.angle))
+                    buf = self.config.log_buffer_cells * self.config.dx
+                    angle = np.float32(np.deg2rad(defn.angle + 90))
                     axis = np.array([np.cos(angle), np.sin(angle)], dtype=np.float32)
-                    half_len = 0.5 * float(defn.length)
+                    half_len = 0.5 * float(defn.length) + buf
                     a = center - half_len * axis
                     rel = points - a
-                    t = np.clip(rel @ axis, 0.0, float(defn.length))
+                    t = np.clip(rel @ axis, 0.0, float(defn.length) + 2 * buf)
                     closest = a + np.outer(t, axis)
-                    core_radius = max(defn.radius * 1.05, 0.5 * min(self.config.dx, self.config.dy))
-                    shell_radius = defn.radius + shell_pad
+                    core_radius = max(defn.radius * 1.05 + buf, 0.5 * min(self.config.dx, self.config.dy))
+                    shell_radius = defn.radius + buf + shell_pad
 
                 delta = points - closest
                 dist = np.linalg.norm(delta, axis=1)
@@ -288,6 +291,7 @@ class VTKPipeline:
             "vorticity": (-10.0, 10.0),
         }
 
+        self._compute_obstacle_grid_mask()
         self._build_pipeline()
         self._add_obstacles(obstacles)
         self._setup_camera()
@@ -298,10 +302,11 @@ class VTKPipeline:
             return
 
         for name in ("h", "eta", "vx", "vy", "speed", "vorticity", "pressure"):
-            np.copyto(
-                self._live_buffers[name],
-                frame_data[name].flatten(order="F").astype(np.float32, copy=False),
-            )
+            flat = frame_data[name].flatten(order="F").astype(np.float32, copy=False)
+            if name == "eta" and self._obstacle_flat_mask is not None:
+                flat = flat.copy()
+                flat[self._obstacle_flat_mask] = self.config.h0
+            np.copyto(self._live_buffers[name], flat)
             self._live_arrays[name].Modified()
 
         vx = frame_data["vx"].flatten(order="F").astype(np.float32)
@@ -734,13 +739,13 @@ class VTKPipeline:
             else:
                 angle = np.deg2rad(defn.angle)
                 axis = np.array([np.cos(angle), np.sin(angle)], dtype=np.float32)
-                half_len = 0.5 * defn.length
+                half_len = 0.5 * defn.length 
                 a = center - half_len * axis
                 rel = pts - a
                 t = np.clip(rel @ axis, 0.0, defn.length)
                 closest = a + np.outer(t, axis)
                 dist = np.linalg.norm(pts - closest, axis=1)
-                search_r = defn.radius * 4.0 + 0.5 * defn.length
+                search_r = defn.radius * 4.0 + 0.5 * defn.length + 0.5 * SimConfig.log_buffer_cells * SimConfig.dx
                 mask = dist <= search_r
 
             if mask.sum() < 4:
@@ -869,6 +874,52 @@ class VTKPipeline:
         self.scalar_bars["particle_trails"].SetVisibility(self.show_particle_trails)
         self.scalar_bars["contours"].SetVisibility(self.show_contours)
 
+    def _compute_obstacle_grid_mask(self):
+        """Precompute a flat boolean mask of obstacle footprints on the live grid."""
+        self._obstacle_flat_mask = None
+        if not self._obstacles or self._live_image is None:
+            return
+        dims = self._live_image.GetDimensions()
+        nx, ny = dims[0], dims[1]
+        orig = self._live_image.GetOrigin()
+        sp = self._live_image.GetSpacing()
+        xs = orig[0] + np.arange(nx, dtype=np.float32) * sp[0]
+        ys = orig[1] + np.arange(ny, dtype=np.float32) * sp[1]
+        ii, jj = np.meshgrid(xs, ys, indexing="ij")
+        combined = np.zeros((nx, ny), dtype=bool)
+        for obs in self._obstacles:
+            defn = obs.definition
+            cx, cy = obs.x, obs.y
+            if defn.kind == "rock":
+                dist = np.sqrt((ii - cx) ** 2 + (jj - cy) ** 2)
+                combined |= dist < defn.radius
+            elif defn.kind == "log":
+                buf = self.config.log_buffer_cells * self.config.dx
+                angle_rad = math.radians(defn.angle + 90)
+                cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
+                dx_local = (ii - cx) * cos_a + (jj - cy) * sin_a
+                dy_local = -(ii - cx) * sin_a + (jj - cy) * cos_a
+                combined |= (np.abs(dx_local) < defn.length / 2 + buf) & (np.abs(dy_local) < defn.radius + buf)
+        self._obstacle_flat_mask = combined.flatten(order="F")
+
+    def _point_in_obstacle(self, x: float, y: float) -> bool:
+        """Return True if world point (x, y) lies inside any obstacle's footprint."""
+        for obs in self._obstacles:
+            defn = obs.definition
+            cx, cy = obs.x, obs.y
+            if defn.kind == "rock":
+                if (x - cx) ** 2 + (y - cy) ** 2 < defn.radius ** 2:
+                    return True
+            elif defn.kind == "log":
+                buf = self.config.log_buffer_cells * self.config.dx
+                angle_rad = math.radians(defn.angle + 90)
+                cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
+                dx_local = (x - cx) * cos_a + (y - cy) * sin_a
+                dy_local = -(x - cx) * sin_a + (y - cy) * cos_a
+                if abs(dx_local) < defn.length / 2 + buf and abs(dy_local) < defn.radius + buf:
+                    return True
+        return False
+
     def _add_obstacles(self, obstacles: list):
         for obs in obstacles:
             actor = create_obstacle_actor(obs, self.config.warp_scale)
@@ -961,15 +1012,16 @@ class VTKPipeline:
                 dist = np.linalg.norm(points - center, axis=1)
                 inside |= dist <= max(defn.radius * 0.95, min(self.config.dx, self.config.dy))
             else:
-                angle = np.deg2rad(defn.angle)
+                buf = self.config.log_buffer_cells * self.config.dx
+                angle = np.deg2rad(defn.angle + 90)
                 axis = np.array([np.cos(angle), np.sin(angle)], dtype=np.float32)
-                half_len = 0.5 * defn.length
+                half_len = 0.5 * defn.length + buf
                 a = center - half_len * axis
                 rel = points - a
-                t = np.clip(rel @ axis, 0.0, defn.length)
+                t = np.clip(rel @ axis, 0.0, defn.length + 2 * buf)
                 closest = a + np.outer(t, axis)
                 dist = np.linalg.norm(points - closest, axis=1)
-                inside |= dist <= max(defn.radius * 1.02, min(self.config.dx, self.config.dy))
+                inside |= dist <= max(defn.radius + buf, min(self.config.dx, self.config.dy))
         return inside
 
     def _sample_velocity(self, data, positions: np.ndarray) -> np.ndarray:
@@ -1101,6 +1153,8 @@ class VTKPipeline:
         particle_speeds.SetName("particle_speed")
 
         for xy, speed in zip(points_xy, point_speeds):
+            if self._obstacles and self._point_in_obstacle(float(xy[0]), float(xy[1])):
+                continue
             pid = particle_points.InsertNextPoint(float(xy[0]), float(xy[1]), 0.0)
             particle_verts.InsertNextCell(1)
             particle_verts.InsertCellPoint(pid)

@@ -35,17 +35,6 @@ def build_bed_elevation(config: SimConfig, obstacles: list) -> np.ndarray:
             mask = dist < r_cells
             vals = defn.height * 0.5 * (1.0 + np.cos(np.pi * np.minimum(dist / r_cells, 1.0)))
             b = np.maximum(b, vals * mask)
-            
-            ## cylinder for testing
-            '''
-            r_cells = defn.radius / config.dx
-            dist = np.sqrt((ii - cx) ** 2 + (jj - cy) ** 2)
-
-            mask = dist < r_cells
-            vals = defn.height * mask.astype(np.float32)
-
-            b = np.maximum(b, vals)
-            '''
             print(b.shape)
 
 
@@ -53,7 +42,7 @@ def build_bed_elevation(config: SimConfig, obstacles: list) -> np.ndarray:
             # Smooth cosine ridge
             r_cells = defn.radius / config.dx
             length_cells = defn.length / config.dx
-            angle_rad = math.radians(defn.angle)
+            angle_rad = math.radians(defn.angle + 90)
             cos_a, sin_a = math.cos(angle_rad), math.sin(angle_rad)
 
             dx_local = (ii - cx) * cos_a + (jj - cy) * sin_a
@@ -126,9 +115,8 @@ def create_log_mesh(obs: PlacedObstacle, warp_scale: float) -> vtk.vtkPolyData:
 
     transform = vtk.vtkTransform()
     transform.Translate(obs.x, obs.y, defn.radius * 0.5)
-    transform.RotateZ(defn.angle)       # rotate in xy-plane
-    #transform.RotateX(90)               # lay cylinder on its side
-    #transform.RotateY(90)  
+    transform.RotateZ(defn.angle)   # rotate in xy-plane
+
 
     tf = vtk.vtkTransformPolyDataFilter()
     tf.SetInputConnection(cyl.GetOutputPort())
