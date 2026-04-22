@@ -16,9 +16,11 @@ class SimConfig:
     dt: float = 0.005
     export_interval: float = 0.1
 
+    particle_interval: float = 5.0
+
     # Was 10.0 s, which is too short for particles to cross a ~9.984 m domain
     # at ~0.5 m/s. 24.0 s gives enough time for full downstream advection.
-    sim_time: float = 24.0
+    sim_time: float = 30.0
 
     use_gpu: bool = False
     warp_scale: float = 4.0
@@ -30,11 +32,11 @@ class SimConfig:
     particle_z_offset: float = 0.14
     particle_trail_z_offset: float = 0.11
 
-    particle_radius: float = 0.030
-    particle_trail_radius: float = 0.012
-    particle_trail_length: int = 16
-    particle_inlet_seed_count: int = 56
-    particle_focus_seed_count: int = 72
+    particle_radius: float = 0.012
+    particle_trail_radius: float = 0.008
+    particle_trail_length: int = 5
+    particle_inlet_seed_count: int = 300
+    particle_focus_seed_count: int = 350
     particle_focus_half_height: float = 0.85
     particle_focus_upstream_offset: float = 0.55
     particle_respawn_speed_threshold: float = 0.010

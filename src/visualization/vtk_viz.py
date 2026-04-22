@@ -71,6 +71,9 @@ class VTKPipeline:
         self._particle_positions = None
         self._particle_speeds = None
         self._particle_respawns = None
+        self._particle_waves: list = []
+        self._live_particle_waves: list = []
+        self._live_next_spawn_frame = 0
         self._display_voi = None
 
         self._build_color_maps()
@@ -255,6 +258,9 @@ class VTKPipeline:
         self._particle_positions = None
         self._particle_speeds = None
         self._particle_respawns = None
+        self._particle_waves = []
+        self._live_particle_waves = []
+        self._live_next_spawn_frame = 0
         self._particle_seed_pool = self._build_particle_seed_pool()
 
         self._live_image = vtk.vtkImageData()
@@ -346,6 +352,7 @@ class VTKPipeline:
                 self._surface_mapper.SetScalarRange(lo, hi)
             self._sync_ranges()
 
+        self._advect_live_particle_waves()
         self._update_particle_visuals(0)
         if render:
             self.renderer.GetRenderWindow().Render()
@@ -537,12 +544,10 @@ class VTKPipeline:
 
         ctf_s = vtk.vtkColorTransferFunction()
         ctf_s.SetColorSpaceToLab()
-        ctf_s.AddRGBPoint(0.0, 0.05, 0.10, 0.50)
-        ctf_s.AddRGBPoint(0.20, 0.08, 0.40, 0.70)
-        ctf_s.AddRGBPoint(0.40, 0.10, 0.65, 0.60)
-        ctf_s.AddRGBPoint(0.60, 0.40, 0.80, 0.20)
-        ctf_s.AddRGBPoint(0.80, 0.90, 0.75, 0.10)
-        ctf_s.AddRGBPoint(1.0, 0.85, 0.15, 0.08)
+        ctf_s.AddRGBPoint(0.0,  1.00, 1.00, 0.00)
+        ctf_s.AddRGBPoint(0.33, 1.00, 0.75, 0.00)
+        ctf_s.AddRGBPoint(0.66, 1.00, 0.40, 0.00)
+        ctf_s.AddRGBPoint(1.0,  0.85, 0.05, 0.05)
         self.ctfs["speed"] = ctf_s
         self.ctfs["viz_speed"] = ctf_s
 
@@ -1018,6 +1023,34 @@ class VTKPipeline:
         self.renderer.SetBackground2(0.28, 0.35, 0.50)
         self.renderer.GradientBackgroundOn()
 
+    def _advect_live_particle_waves(self):
+        data = self._live_image
+        if data is None or self._particle_seed_pool.size == 0:
+            return
+
+        spawn_interval = max(1, round(self.config.particle_interval / self.config.export_interval))
+        if (self._live_frame_counter - 1) % spawn_interval == 0:
+            self._live_particle_waves.append({
+                'positions': self._particle_seed_pool.copy(),
+                'speeds': np.zeros(self._particle_seed_pool.shape[0], dtype=np.float32),
+            })
+
+        dt = self.config.export_interval
+        x_min = self.config.dx
+        x_max = self.config.domain_width - self.config.dx
+        wall_buf = self.config.wall_buffer_cells * self.config.dy
+        y_min = wall_buf
+        y_max = self.config.domain_height - wall_buf
+
+        for wave in self._live_particle_waves:
+            positions = wave['positions']
+            vel = self._sample_velocity(data, positions)
+            wave['speeds'] = np.linalg.norm(vel, axis=1).astype(np.float32)
+            new_pos = (positions + dt * vel).astype(np.float32)
+            new_pos[:, 0] = np.clip(new_pos[:, 0], x_min, x_max)
+            new_pos[:, 1] = np.clip(new_pos[:, 1], y_min, y_max)
+            wave['positions'] = new_pos
+
     def _build_particle_seed_pool(self) -> np.ndarray:
         x_inlet = self.config.dx * 1.5 + self.config.x_outlet_buffer_cells * self.config.dx
         buf = self.config.wall_buffer_cells * self.config.dy
@@ -1132,6 +1165,7 @@ class VTKPipeline:
 
     def _precompute_particle_history(self):
         self._particle_seed_pool = self._build_particle_seed_pool()
+        self._particle_waves = []
         if self._particle_seed_pool.size == 0 or self.num_frames <= 0:
             self._particle_positions = np.zeros((0, 0, 2), dtype=np.float32)
             self._particle_speeds = np.zeros((0, 0), dtype=np.float32)
@@ -1139,12 +1173,8 @@ class VTKPipeline:
             return
 
         n_particles = self._particle_seed_pool.shape[0]
-        positions = self._particle_seed_pool.copy()
         rng = np.random.default_rng(20260414)
-
-        history = np.zeros((self.num_frames, n_particles, 2), dtype=np.float32)
-        speeds = np.zeros((self.num_frames, n_particles), dtype=np.float32)
-        respawns = np.zeros((self.num_frames, n_particles), dtype=bool)
+        spawn_interval = max(1, round(self.config.particle_interval / self.config.export_interval))
 
         dt = float(self.config.export_interval)
         x_min = self.config.dx * 1.0
@@ -1153,58 +1183,114 @@ class VTKPipeline:
         y_min = buf
         y_max = self.config.domain_height - buf
 
+        active_waves = []
+
         for frame_idx in range(self.num_frames):
             if not self._load_frame(frame_idx):
                 break
             data = self.reader.GetOutput()
-            history[frame_idx] = positions
 
-            k1 = self._sample_velocity(data, positions)
-            mid = positions + 0.5 * dt * k1
-            mid[:, 0] = np.clip(mid[:, 0], x_min, x_max)
-            mid[:, 1] = np.clip(mid[:, 1], y_min, y_max)
-            k2 = self._sample_velocity(data, mid)
-            speeds[frame_idx] = np.linalg.norm(k2, axis=1).astype(np.float32)
+            if frame_idx % spawn_interval == 0:
+                active_waves.append({
+                    'spawn_frame': frame_idx,
+                    'positions': self._particle_seed_pool.copy(),
+                    'history': [],
+                    'speeds': [],
+                    'respawns': [],
+                    'pending_respawn_mask': np.zeros(n_particles, dtype=bool),
+                })
 
-            next_positions = positions + dt * k2
-            outside = (
-                (next_positions[:, 0] < x_min)
-                | (next_positions[:, 0] > x_max)
-                | (next_positions[:, 1] < y_min)
-                | (next_positions[:, 1] > y_max)
-            )
-            inside = self._points_inside_obstacles(next_positions)
-            stalled = speeds[frame_idx] < self.config.particle_respawn_speed_threshold
-            respawn_mask = outside | inside | (stalled & (frame_idx > 2))
+            for wave in active_waves:
+                positions = wave['positions']
 
-            next_positions[:, 0] = np.clip(next_positions[:, 0], x_min, x_max)
-            next_positions[:, 1] = np.clip(next_positions[:, 1], y_min, y_max)
+                wave['respawns'].append(wave['pending_respawn_mask'].copy())
+                wave['pending_respawn_mask'][:] = False
 
-            if np.any(respawn_mask):
-                seed_idx = rng.integers(0, self._particle_seed_pool.shape[0], size=int(respawn_mask.sum()))
-                next_positions[respawn_mask] = self._particle_seed_pool[seed_idx]
-                if frame_idx + 1 < self.num_frames:
-                    respawns[frame_idx + 1, respawn_mask] = True
+                wave['history'].append(positions.copy())
 
-            positions = next_positions.astype(np.float32, copy=False)
+                k1 = self._sample_velocity(data, positions)
+                mid = positions + 0.5 * dt * k1
+                mid[:, 0] = np.clip(mid[:, 0], x_min, x_max)
+                mid[:, 1] = np.clip(mid[:, 1], y_min, y_max)
+                k2 = self._sample_velocity(data, mid)
+                spds = np.linalg.norm(k2, axis=1).astype(np.float32)
+                wave['speeds'].append(spds)
 
-        self._particle_positions = history
-        self._particle_speeds = speeds
-        self._particle_respawns = respawns
+                next_positions = positions + dt * k2
+                outside = (
+                    (next_positions[:, 0] < x_min)
+                    | (next_positions[:, 0] > x_max)
+                    | (next_positions[:, 1] < y_min)
+                    | (next_positions[:, 1] > y_max)
+                )
+                inside = self._points_inside_obstacles(next_positions)
+                local_t = frame_idx - wave['spawn_frame']
+                stalled = spds < self.config.particle_respawn_speed_threshold
+                respawn_mask = outside | inside | (stalled & (local_t > 2))
+
+                next_positions[:, 0] = np.clip(next_positions[:, 0], x_min, x_max)
+                next_positions[:, 1] = np.clip(next_positions[:, 1], y_min, y_max)
+
+                if np.any(respawn_mask):
+                    seed_idx = rng.integers(0, n_particles, size=int(respawn_mask.sum()))
+                    next_positions[respawn_mask] = self._particle_seed_pool[seed_idx]
+                    wave['pending_respawn_mask'][respawn_mask] = True
+
+                wave['positions'] = next_positions.astype(np.float32, copy=False)
+
+        for wave in active_waves:
+            if not wave['history']:
+                continue
+            self._particle_waves.append({
+                'spawn_frame': wave['spawn_frame'],
+                'history': np.array(wave['history'], dtype=np.float32),
+                'speeds': np.array(wave['speeds'], dtype=np.float32),
+                'respawns': np.array(wave['respawns'], dtype=bool),
+            })
+
+        if self._particle_waves:
+            w0 = self._particle_waves[0]
+            self._particle_positions = w0['history']
+            self._particle_speeds = w0['speeds']
+            self._particle_respawns = w0['respawns']
+        else:
+            self._particle_positions = np.zeros((0, 0, 2), dtype=np.float32)
+            self._particle_speeds = np.zeros((0, 0), dtype=np.float32)
+            self._particle_respawns = np.zeros((0, 0), dtype=bool)
 
     def _update_particle_visuals(self, frame_idx: int):
         if self._particle_poly is None or self._particle_trail_poly is None:
             return
 
-        if self._is_live or self._particle_positions is None or self._particle_positions.size == 0:
-            points_xy = self._particle_seed_pool
-            point_speeds = np.zeros(points_xy.shape[0], dtype=np.float32)
-            respawns = None
+        if self._is_live:
+            if self._live_particle_waves:
+                points_xy = np.concatenate([w['positions'] for w in self._live_particle_waves], axis=0)
+                point_speeds = np.concatenate([w['speeds'] for w in self._live_particle_waves], axis=0)
+            else:
+                points_xy = self._particle_seed_pool
+                point_speeds = np.zeros(points_xy.shape[0], dtype=np.float32)
         else:
-            frame_idx = int(np.clip(frame_idx, 0, self._particle_positions.shape[0] - 1))
-            points_xy = self._particle_positions[frame_idx]
-            point_speeds = self._particle_speeds[frame_idx]
-            respawns = self._particle_respawns
+            if self._particle_waves:
+                frame_idx = int(np.clip(frame_idx, 0, self.num_frames - 1))
+                xy_parts, spd_parts = [], []
+                for wave in self._particle_waves:
+                    local_t = frame_idx - wave['spawn_frame']
+                    if 0 <= local_t < wave['history'].shape[0]:
+                        xy_parts.append(wave['history'][local_t])
+                        spd_parts.append(wave['speeds'][local_t])
+                if xy_parts:
+                    points_xy = np.concatenate(xy_parts, axis=0)
+                    point_speeds = np.concatenate(spd_parts, axis=0)
+                else:
+                    points_xy = np.empty((0, 2), dtype=np.float32)
+                    point_speeds = np.empty(0, dtype=np.float32)
+            else:
+                points_xy = np.empty((0, 2), dtype=np.float32)
+                point_speeds = np.empty(0, dtype=np.float32)
+
+        wall_buf = self.config.wall_buffer_cells * self.config.dy
+        y_lo = wall_buf
+        y_hi = self.config.domain_height - wall_buf
 
         particle_points = vtk.vtkPoints()
         particle_verts = vtk.vtkCellArray()
@@ -1213,6 +1299,8 @@ class VTKPipeline:
 
         for xy, speed in zip(points_xy, point_speeds):
             if self._obstacles and self._point_in_obstacle(float(xy[0]), float(xy[1])):
+                continue
+            if float(xy[1]) < y_lo or float(xy[1]) > y_hi:
                 continue
             pid = particle_points.InsertNextPoint(float(xy[0]), float(xy[1]), 0.0)
             particle_verts.InsertNextCell(1)
@@ -1236,27 +1324,35 @@ class VTKPipeline:
         trail_speeds = vtk.vtkFloatArray()
         trail_speeds.SetName("particle_speed")
 
-        if not self._is_live and self._particle_positions is not None and self._particle_positions.size > 0:
-            start_frame = max(0, frame_idx - self.config.particle_trail_length + 1)
+        if not self._is_live and self._particle_waves:
             jump_thresh = self.config.particle_respawn_jump_threshold
+            for wave in self._particle_waves:
+                local_frame = frame_idx - wave['spawn_frame']
+                if local_frame < 0:
+                    continue
+                local_frame = min(local_frame, wave['history'].shape[0] - 1)
+                start_local = max(0, local_frame - self.config.particle_trail_length + 1)
+                wave_history = wave['history']
+                wave_speeds_arr = wave['speeds']
+                wave_respawns = wave['respawns']
 
-            for particle_idx in range(self._particle_positions.shape[1]):
-                current_segment = []
-                for t in range(start_frame, frame_idx + 1):
-                    if respawns is not None and respawns[t, particle_idx] and current_segment:
-                        self._append_trail_segment(current_segment, trail_points, trail_lines, trail_speeds)
-                        current_segment = []
-
-                    xy = self._particle_positions[t, particle_idx]
-                    current_segment.append((float(xy[0]), float(xy[1]), 0.0, float(self._particle_speeds[t, particle_idx])))
-
-                    if t < frame_idx:
-                        nxt = self._particle_positions[t + 1, particle_idx]
-                        jump = np.linalg.norm(nxt - xy)
-                        if jump > jump_thresh:
+                for particle_idx in range(wave_history.shape[1]):
+                    current_segment = []
+                    for lt in range(start_local, local_frame + 1):
+                        if wave_respawns[lt, particle_idx] and current_segment:
                             self._append_trail_segment(current_segment, trail_points, trail_lines, trail_speeds)
                             current_segment = []
-                self._append_trail_segment(current_segment, trail_points, trail_lines, trail_speeds)
+
+                        xy = wave_history[lt, particle_idx]
+                        current_segment.append((float(xy[0]), float(xy[1]), 0.0, float(wave_speeds_arr[lt, particle_idx])))
+
+                        if lt < local_frame:
+                            nxt = wave_history[lt + 1, particle_idx]
+                            jump = np.linalg.norm(nxt - xy)
+                            if jump > jump_thresh:
+                                self._append_trail_segment(current_segment, trail_points, trail_lines, trail_speeds)
+                                current_segment = []
+                    self._append_trail_segment(current_segment, trail_points, trail_lines, trail_speeds)
 
         self._particle_trail_poly.SetPoints(trail_points)
         self._particle_trail_poly.SetLines(trail_lines)
