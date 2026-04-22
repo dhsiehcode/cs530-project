@@ -341,7 +341,7 @@ class SWESolver:
             self.vx[i, j] = u
             self.vy[i, j] = v
             self.speed[i, j] = ti.sqrt(u * u + v * v)
-            self.pressure[i, j] = 0.5 * g * h_val * h_val
+            self.pressure[i, j] = g * h_val
 
         for i, j in self.vorticity:
             if 0 < i < nx - 1 and 0 < j < ny - 1:

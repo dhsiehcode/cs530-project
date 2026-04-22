@@ -81,7 +81,7 @@ class MainWindow(QMainWindow):
             self.bottom_bar.configure_timeline(1, self.config.export_interval)
             self.bottom_bar.set_playback_enabled(False)
 
-        start_frame =  self.bottom_bar._min_frame
+        start_frame = self.bottom_bar._min_frame
         self.pipeline.set_frame(start_frame)
         self.bottom_bar.set_frame(start_frame, emit_signal=False)
         self.pipeline.setup_coordinate_display(self.vtk_widget)
@@ -135,7 +135,8 @@ class MainWindow(QMainWindow):
     def on_scalar_field_changed(self, label: str):
         mapping = {
             "Height": "h",
-            "Speed": "speed",
+            "Velocity": "viz_speed",
+            "Pressure": "pressure",
             "Vorticity": "vorticity",
         }
         field = mapping.get(label)

@@ -11,10 +11,12 @@ from simulation.obstacles import create_obstacle_actor
 class VTKPipeline:
     """Manages the VTK rendering pipeline for the SWE visualization."""
 
-    SCALAR_FIELDS = ("h", "speed", "vorticity")
+    SCALAR_FIELDS = ("h", "speed", "viz_speed", "pressure", "vorticity")
     SCALAR_LABELS = {
         "h": "Height (m)",
         "speed": "Speed (m/s)",
+        "viz_speed": "Velocity (m/s)",
+        "pressure": "Pressure",
         "vorticity": "Vorticity (1/s)",
     }
 
@@ -75,6 +77,8 @@ class VTKPipeline:
         self.scalar_ranges = {
             "h": (0.0, 1.0),
             "speed": (0.0, 1.5),
+            "viz_speed": (0.0, 1.5),
+            "pressure": (0.0, max(0.10, 0.5 * self.config.g * (1.5 * self.config.h0) ** 2)),
             "vorticity": (-10.0, 10.0),
         }
 
@@ -282,6 +286,8 @@ class VTKPipeline:
         pd.SetActiveScalars("h")
         pd.SetActiveVectors("velocity")
 
+        self._apply_obstacle_aware_flow()
+
         self._live_producer = vtk.vtkTrivialProducer()
         self._live_producer.SetOutput(self._live_image)
         self._source = self._live_producer
@@ -289,6 +295,8 @@ class VTKPipeline:
         self.scalar_ranges = {
             "h": (0.0, 1.0),
             "speed": (0.0, 2.0),
+            "viz_speed": (0.0, 2.0),
+            "pressure": (0.0, max(0.10, 0.5 * self.config.g * (1.5 * self.config.h0) ** 2)),
             "vorticity": (-10.0, 10.0),
         }
 
@@ -372,6 +380,7 @@ class VTKPipeline:
         self._surface_mapper.SelectColorArray(field_name)
         self._surface_mapper.SetScalarRange(lo, hi)
         self._surface_mapper.SetLookupTable(self.ctfs[field_name])
+        self._surface_mapper.SetScalarRange(lo, hi)
         if self.scalar_bars.get("surface"):
             self.scalar_bars["surface"].SetLookupTable(self.ctfs[field_name])
             self.scalar_bars["surface"].SetTitle(self.SCALAR_LABELS[field_name])
@@ -535,6 +544,16 @@ class VTKPipeline:
         ctf_s.AddRGBPoint(0.80, 0.90, 0.75, 0.10)
         ctf_s.AddRGBPoint(1.0, 0.85, 0.15, 0.08)
         self.ctfs["speed"] = ctf_s
+        self.ctfs["viz_speed"] = ctf_s
+
+        ctf_p = vtk.vtkColorTransferFunction()
+        ctf_p.SetColorSpaceToLab()
+        ctf_p.AddRGBPoint(0.0, 0.07, 0.10, 0.28)
+        ctf_p.AddRGBPoint(0.20, 0.10, 0.32, 0.62)
+        ctf_p.AddRGBPoint(0.45, 0.26, 0.62, 0.74)
+        ctf_p.AddRGBPoint(0.70, 0.86, 0.74, 0.26)
+        ctf_p.AddRGBPoint(1.0, 0.78, 0.16, 0.08)
+        self.ctfs["pressure"] = ctf_p
 
         ctf_v = vtk.vtkColorTransferFunction()
         ctf_v.SetColorSpaceToDiverging()
@@ -608,7 +627,6 @@ class VTKPipeline:
         self.renderer.AddActor(actor)
         self._water_body_actor = actor
 
-
     def _surface_offset_filter(self, input_port):
         geom = vtk.vtkImageDataGeometryFilter()
         geom.SetInputConnection(input_port)
@@ -630,7 +648,6 @@ class VTKPipeline:
             vtk.vtkAssignAttribute.POINT_DATA,
         )
         return assign
-
 
     def _build_surface(self):
         assign = self._surface_offset_filter(self._get_source_port())
@@ -783,7 +800,7 @@ class VTKPipeline:
             else:
                 angle = np.deg2rad(defn.angle)
                 axis = np.array([np.cos(angle), np.sin(angle)], dtype=np.float32)
-                half_len = 0.5 * defn.length 
+                half_len = 0.5 * defn.length
                 a = center - half_len * axis
                 rel = pts - a
                 t = np.clip(rel @ axis, 0.0, defn.length)
@@ -821,25 +838,22 @@ class VTKPipeline:
 
         lo, hi = self.scalar_ranges["vorticity"]
         global_mag = max(abs(lo), abs(hi), 0.1)
+
         data = self._get_current_data()
         if data is not None:
             arr = data.GetPointData().GetArray("vorticity")
             if arr is not None:
                 values = vtk_to_numpy(arr).astype(np.float32)
-                global_mag = float(np.percentile(np.abs(values), 95))
-                global_mag = max(global_mag, 0.1)
+                nonzero = np.abs(values[np.abs(values) > 1.0e-6])
+                if nonzero.size:
+                    global_mag = float(np.percentile(nonzero, 95))
+                    global_mag = max(global_mag, 0.1)
 
-        # Square-root spacing: denser near zero (weak background rotation),
-        # sparser at the extremes (strong shear). 5 levels per sign = 10 total.
-        #t = np.linspace(0.0, 1.0, 6, dtype=np.float32)[1:]  # skip zero
-        #sqrt_fracs = np.sqrt(t)  # [0.45, 0.63, 0.77, 0.89, 1.0]
-        #sqrt_fracs = [0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.6, 0.7]
-        #pos = sqrt_fracs * global_mag
-        #global_levels = np.concatenate([-pos[::-1], pos])
-        global_levels = np.array([-0.05, -0.1, -0.15, -0.2, -0.3, -0.4, -0.6, -0.7, 0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.6, 0.7], dtype=np.float32) * global_mag
-        local_levels = self._obstacle_local_contour_levels(data, global_mag)
-
-        levels = np.unique(np.concatenate([global_levels, local_levels]).round(6))
+        # Keep contours simple and global only.
+        # The old code added obstacle-local contour levels, which made the tubes
+        # bunch up into a jagged ring around rocks.
+        pos = np.array([0.12, 0.22, 0.36, 0.55], dtype=np.float32) * global_mag
+        levels = np.concatenate([-pos[::-1], pos])
 
         contour.SetNumberOfContours(len(levels))
         for idx, value in enumerate(levels):
@@ -848,27 +862,27 @@ class VTKPipeline:
         base_z = self.config.warp_scale * self.config.h0
         transform = vtk.vtkTransform()
         transform.Translate(0, 0, base_z + self.config.contour_z_offset)
+
         tf = vtk.vtkTransformPolyDataFilter()
         tf.SetInputConnection(contour.GetOutputPort())
         tf.SetTransform(transform)
 
         tube = vtk.vtkTubeFilter()
         tube.SetInputConnection(tf.GetOutputPort())
-        tube.SetRadius(0.026 if self._is_live else 0.016)
-        tube.SetNumberOfSides(10)
+        tube.SetRadius(0.014 if self._is_live else 0.009)
+        tube.SetNumberOfSides(12)
         tube.CappingOn()
 
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(tube.GetOutputPort())
         mapper.SetScalarModeToUsePointFieldData()
         mapper.SelectColorArray("vorticity")
-        full_mag = max(float(np.abs(levels).max()), global_mag, 0.1)
-        mapper.SetScalarRange(-full_mag, full_mag)
+        mapper.SetScalarRange(-global_mag, global_mag)
         mapper.SetLookupTable(self.ctfs["vorticity"])
 
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
-        actor.GetProperty().SetOpacity(0.95)
+        actor.GetProperty().SetOpacity(0.80)
         actor.SetVisibility(self.show_contours)
 
         self.renderer.AddActor(actor)
