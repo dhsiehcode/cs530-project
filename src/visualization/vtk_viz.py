@@ -68,6 +68,7 @@ class VTKPipeline:
         self._particle_trail_poly = None
         self._particle_trail_speed_array = None
         self._particle_seed_pool = np.empty((0, 2), dtype=np.float32)
+        self._particle_inlet_seed_count = 0
         self._particle_positions = None
         self._particle_speeds = None
         self._particle_respawns = None
@@ -1061,28 +1062,7 @@ class VTKPipeline:
         inlet_count = max(8, int(self.config.particle_inlet_seed_count))
         for y in np.linspace(y_min, y_max, inlet_count, dtype=np.float32):
             seeds.append([x_inlet, y])
-
-        focus_count = int(self.config.particle_focus_seed_count)
-        if self._obstacles and focus_count > 0:
-            per_obs = max(8, focus_count // len(self._obstacles))
-            for obs in self._obstacles:
-                defn = obs.definition
-                upstream = max(
-                    x_inlet,
-                    obs.x - max(self.config.particle_focus_upstream_offset, 1.5 * defn.radius),
-                )
-                span = max(
-                    self.config.particle_focus_half_height,
-                    2.0 * defn.radius if defn.kind == "rock" else 2.0 * defn.radius + 0.25 * defn.length,
-                )
-                ys = np.linspace(
-                    max(y_min, obs.y - span),
-                    min(y_max, obs.y + span),
-                    per_obs,
-                    dtype=np.float32,
-                )
-                for y in ys:
-                    seeds.append([upstream, y])
+        self._particle_inlet_seed_count = inlet_count
 
         if not seeds:
             return np.empty((0, 2), dtype=np.float32)
@@ -1232,7 +1212,8 @@ class VTKPipeline:
                 next_positions[:, 1] = np.clip(next_positions[:, 1], y_min, y_max)
 
                 if np.any(respawn_mask):
-                    seed_idx = rng.integers(0, n_particles, size=int(respawn_mask.sum()))
+                    n_inlet = max(1, self._particle_inlet_seed_count)
+                    seed_idx = rng.integers(0, n_inlet, size=int(respawn_mask.sum()))
                     next_positions[respawn_mask] = self._particle_seed_pool[seed_idx]
                     wave['pending_respawn_mask'][respawn_mask] = True
 
