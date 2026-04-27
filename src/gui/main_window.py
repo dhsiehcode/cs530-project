@@ -137,7 +137,7 @@ class MainWindow(QMainWindow):
             "Height": "h",
             "Velocity": "viz_speed",
             "Pressure": "pressure",
-            "Vorticity": "vorticity",
+            "Vorticity": "lavd_vorticity",
         }
         field = mapping.get(label)
         if field:

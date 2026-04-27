@@ -11,13 +11,14 @@ from simulation.obstacles import create_obstacle_actor
 class VTKPipeline:
     """Manages the VTK rendering pipeline for the SWE visualization."""
 
-    SCALAR_FIELDS = ("h", "speed", "viz_speed", "pressure", "vorticity")
+    SCALAR_FIELDS = ("h", "speed", "viz_speed", "pressure", "vorticity", "lavd_vorticity")
     SCALAR_LABELS = {
         "h": "Height (m)",
         "speed": "Speed (m/s)",
         "viz_speed": "Velocity (m/s)",
         "pressure": "Pressure",
-        "vorticity": "Vorticity (1/s)",
+        "vorticity": "Raw Vorticity (1/s)",
+        "lavd_vorticity": "LAVD Vorticity Deviation",
     }
 
     def __init__(self, config: SimConfig, renderer: vtk.vtkRenderer):
@@ -76,6 +77,7 @@ class VTKPipeline:
         self._live_particle_waves: list = []
         self._live_next_spawn_frame = 0
         self._display_voi = None
+        
 
         self._build_color_maps()
         self.scalar_ranges = {
@@ -84,6 +86,7 @@ class VTKPipeline:
             "viz_speed": (0.0, 1.5),
             "pressure": (0.0, max(0.10, 0.5 * self.config.g * (1.5 * self.config.h0) ** 2)),
             "vorticity": (-10.0, 10.0),
+            "lavd_vorticity": (0.0, 1.0),
         }
 
     def _get_source_port(self):
@@ -126,7 +129,120 @@ class VTKPipeline:
         arr.DeepCopy(vtk_arr)
         arr.Modified()
         return arr
+    def _bilinear_sample_grid(self, data, field_2d: np.ndarray, positions: np.ndarray) -> np.ndarray:
+        """Sample a scalar grid at floating-point XY positions."""
+        dims = data.GetDimensions()
+        origin = data.GetOrigin()
+        spacing = data.GetSpacing()
+        nx, ny = dims[0], dims[1]
 
+        gx = (positions[:, 0] - origin[0]) / max(spacing[0], 1.0e-8)
+        gy = (positions[:, 1] - origin[1]) / max(spacing[1], 1.0e-8)
+
+        gx = np.clip(gx, 0.0, nx - 1.001)
+        gy = np.clip(gy, 0.0, ny - 1.001)
+
+        i0 = np.floor(gx).astype(np.int32)
+        j0 = np.floor(gy).astype(np.int32)
+        i1 = np.clip(i0 + 1, 0, nx - 1)
+        j1 = np.clip(j0 + 1, 0, ny - 1)
+
+        tx = (gx - i0).astype(np.float32)
+        ty = (gy - j0).astype(np.float32)
+
+        f00 = field_2d[i0, j0]
+        f10 = field_2d[i1, j0]
+        f01 = field_2d[i0, j1]
+        f11 = field_2d[i1, j1]
+
+        return (
+            (1.0 - tx) * (1.0 - ty) * f00
+            + tx * (1.0 - ty) * f10
+            + (1.0 - tx) * ty * f01
+            + tx * ty * f11
+        ).astype(np.float32)
+
+
+    def _compute_lavd_vorticity_field(self, data) -> np.ndarray:
+        """
+        Compute a LAVD-style scalar field for the water surface.
+
+        This does not create or modify visible particles.
+        It uses hidden massless samples seeded on the grid, advects them through
+        the current obstacle-aware velocity field, and accumulates local vorticity
+        deviation from the regional mean.
+        """
+        if data is None:
+            return np.empty(0, dtype=np.float32)
+
+        pd = data.GetPointData()
+        vx_arr = pd.GetArray("viz_vx")
+        vy_arr = pd.GetArray("viz_vy")
+
+        # Fallback to raw velocity if obstacle-aware velocity is unavailable.
+        if vx_arr is None or vy_arr is None:
+            vx_arr = pd.GetArray("vx")
+            vy_arr = pd.GetArray("vy")
+
+        if vx_arr is None or vy_arr is None:
+            dims = data.GetDimensions()
+            return np.zeros(dims[0] * dims[1], dtype=np.float32)
+
+        dims = data.GetDimensions()
+        spacing = data.GetSpacing()
+        origin = data.GetOrigin()
+        nx, ny = dims[0], dims[1]
+
+        vx = vtk_to_numpy(vx_arr).reshape((nx, ny), order="F").astype(np.float32, copy=False)
+        vy = vtk_to_numpy(vy_arr).reshape((nx, ny), order="F").astype(np.float32, copy=False)
+
+        # 2-D vorticity: omega_z = d(vy)/dx - d(vx)/dy
+        dvy_dx = np.gradient(vy, max(spacing[0], 1.0e-8), axis=0)
+        dvx_dy = np.gradient(vx, max(spacing[1], 1.0e-8), axis=1)
+        omega = (dvy_dx - dvx_dy).astype(np.float32)
+
+        # Deviation from regional average, matching the LAVD idea from the slides.
+        omega_mean = float(np.mean(omega))
+        omega_dev = np.abs(omega - omega_mean).astype(np.float32)
+
+        xs = origin[0] + np.arange(nx, dtype=np.float32) * spacing[0]
+        ys = origin[1] + np.arange(ny, dtype=np.float32) * spacing[1]
+        xx, yy = np.meshgrid(xs, ys, indexing="ij")
+        positions = np.column_stack([
+            xx.ravel(order="F"),
+            yy.ravel(order="F"),
+        ]).astype(np.float32)
+
+        accum = np.zeros(positions.shape[0], dtype=np.float32)
+
+        # Hidden massless pathline integration.
+        # This is a short-window LAVD proxy over the current frame's velocity field.
+        lavd_steps = 10
+        dt = float(self.config.export_interval) / float(lavd_steps)
+
+        x_min = origin[0]
+        x_max = origin[0] + (nx - 1) * spacing[0]
+        y_min = origin[1]
+        y_max = origin[1] + (ny - 1) * spacing[1]
+
+        for _ in range(lavd_steps):
+            local_dev = self._bilinear_sample_grid(data, omega_dev, positions)
+            local_vx = self._bilinear_sample_grid(data, vx, positions)
+            local_vy = self._bilinear_sample_grid(data, vy, positions)
+
+            accum += local_dev * dt
+
+            positions[:, 0] += local_vx * dt
+            positions[:, 1] += local_vy * dt
+            positions[:, 0] = np.clip(positions[:, 0], x_min, x_max)
+            positions[:, 1] = np.clip(positions[:, 1], y_min, y_max)
+
+        # Normalize so the surface color map actually shows something.
+        hi = float(np.percentile(accum, 98.0)) if accum.size else 1.0
+        hi = max(hi, 1.0e-6)
+        lavd = np.clip(accum / hi, 0.0, 1.0).astype(np.float32)
+
+        return lavd
     def _apply_obstacle_aware_flow(self):
         data = self._get_current_data()
         if data is None:
@@ -232,6 +348,8 @@ class VTKPipeline:
         self._upsert_array(pd, "viz_velocity", viz_velocity, components=3)
 
         pd.SetActiveScalars("h")
+        lavd_vorticity = self._compute_lavd_vorticity_field(data)
+        self._upsert_array(pd, "lavd_vorticity", lavd_vorticity)
         pd.SetActiveVectors("velocity")
         data.Modified()
 
@@ -305,6 +423,7 @@ class VTKPipeline:
             "viz_speed": (0.0, 2.0),
             "pressure": (0.0, max(0.10, 0.5 * self.config.g * (1.5 * self.config.h0) ** 2)),
             "vorticity": (-10.0, 10.0),
+            "lavd_vorticity": (0.0, 1.0),
         }
 
         self._compute_obstacle_grid_mask()
@@ -568,6 +687,16 @@ class VTKPipeline:
         ctf_v.AddRGBPoint(10.0, 0.706, 0.016, 0.150)
         self.ctfs["vorticity"] = ctf_v
 
+
+        ctf_lavd = vtk.vtkColorTransferFunction()
+        ctf_lavd.SetColorSpaceToLab()
+        ctf_lavd.AddRGBPoint(0.0, 0.02, 0.05, 0.18)
+        ctf_lavd.AddRGBPoint(0.20, 0.04, 0.22, 0.45)
+        ctf_lavd.AddRGBPoint(0.45, 0.00, 0.55, 0.70)
+        ctf_lavd.AddRGBPoint(0.70, 0.95, 0.75, 0.20)
+        ctf_lavd.AddRGBPoint(1.0, 0.90, 0.10, 0.05)
+        self.ctfs["lavd_vorticity"] = ctf_lavd
+
     def _build_pipeline(self):
         self.clear()
         self._build_display_voi()
@@ -662,7 +791,8 @@ class VTKPipeline:
         warp.SetInputConnection(assign.GetOutputPort())
 
         # Exaggerate only the wave deviation.
-        warp.SetScaleFactor(self.config.warp_scale * 6.0)
+        # warp.SetScaleFactor(self.config.warp_scale * 6.0)
+        warp.SetScaleFactor(self.config.warp_scale * 3.0)
 
         normals = vtk.vtkPolyDataNormals()
         normals.SetInputConnection(warp.GetOutputPort())
