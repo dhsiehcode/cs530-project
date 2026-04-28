@@ -137,7 +137,7 @@ class MainWindow(QMainWindow):
             "Height": "h",
             "Velocity": "viz_speed",
             "Pressure": "pressure",
-            "Vorticity": "lavd_vorticity",
+            "LAVD": "lavd_vorticity",
         }
         field = mapping.get(label)
         if field:
@@ -148,7 +148,7 @@ class MainWindow(QMainWindow):
             "water surface": "surface",
             "particles": "particles",
             "particle trails": "particle_trails",
-            "contours": "contours",
+            "vorticity": "contours",
         }
         target = mapping.get(layer, layer)
         self.pipeline.set_layer_visibility(target, visible)

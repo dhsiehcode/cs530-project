@@ -350,7 +350,9 @@ class VTKPipeline:
         pd.SetActiveScalars("h")
         lavd_vorticity = self._compute_lavd_vorticity_field(data)
         self._upsert_array(pd, "lavd_vorticity", lavd_vorticity)
-        pd.SetActiveVectors("velocity")
+        # pd.SetActiveVectors("velocity")
+        # data.Modified()
+        pd.SetActiveVectors("viz_velocity")
         data.Modified()
 
     def load_simulation(self, data_dir: str, num_frames: int, obstacles: list):
@@ -639,8 +641,22 @@ class VTKPipeline:
                 self.scalar_ranges[name] = (lo, hi)
         self._sync_ranges()
 
+    # def _sync_ranges(self):
+    #     lo, hi = self.scalar_ranges["speed"]
+    #     if self._particle_mapper:
+    #         self._particle_mapper.SetScalarRange(lo, hi)
+    #     if self._particle_trail_mapper:
+    #         self._particle_trail_mapper.SetScalarRange(lo, hi)
+    #     if self._contour_mapper:
+    #         vlo, vhi = self.scalar_ranges["vorticity"]
+    #         self._contour_mapper.SetScalarRange(vlo, vhi)
+
     def _sync_ranges(self):
-        lo, hi = self.scalar_ranges["speed"]
+        # Keep particle colors readable for your normal inlet speed.
+        # ux is 0.5, so a 0..1 range gives much better contrast than 0..1.5 or 0..2.
+        hi = max(0.8, float(self.config.ux) * 2.0)
+        lo = 0.0
+
         if self._particle_mapper:
             self._particle_mapper.SetScalarRange(lo, hi)
         if self._particle_trail_mapper:
@@ -664,10 +680,16 @@ class VTKPipeline:
 
         ctf_s = vtk.vtkColorTransferFunction()
         ctf_s.SetColorSpaceToLab()
-        ctf_s.AddRGBPoint(0.0,  1.00, 1.00, 0.00)
-        ctf_s.AddRGBPoint(0.33, 1.00, 0.75, 0.00)
-        ctf_s.AddRGBPoint(0.66, 1.00, 0.40, 0.00)
-        ctf_s.AddRGBPoint(1.0,  0.85, 0.05, 0.05)
+
+        # Now low speed is dark blue, not yellow.
+        # This makes it obvious when particles are actually slow/stalled.
+        ctf_s.AddRGBPoint(0.0,  0.18, 0.18, 0.18)  # dark gray
+        ctf_s.AddRGBPoint(0.18, 0.10, 0.45, 0.10)  # dark green
+        ctf_s.AddRGBPoint(0.38, 0.20, 0.75, 0.18)  # green
+        ctf_s.AddRGBPoint(0.58, 0.80, 0.85, 0.12)  # yellow-green
+        ctf_s.AddRGBPoint(0.78, 0.98, 0.60, 0.05)  # orange
+        ctf_s.AddRGBPoint(1.0,  0.88, 0.08, 0.05)  # red
+
         self.ctfs["speed"] = ctf_s
         self.ctfs["viz_speed"] = ctf_s
 
@@ -854,8 +876,9 @@ class VTKPipeline:
         mapper.SetInputConnection(glyph.GetOutputPort())
         mapper.SetScalarModeToUsePointFieldData()
         mapper.SelectColorArray("particle_speed")
-        lo, hi = self.scalar_ranges["speed"]
-        mapper.SetScalarRange(lo, hi)
+        # lo, hi = self.scalar_ranges["speed"]
+        # mapper.SetScalarRange(lo, hi)
+        mapper.SetScalarRange(0.0, max(0.8, float(self.config.ux) * 2.0))
         mapper.SetLookupTable(self.ctfs["speed"])
 
         actor = vtk.vtkActor()
@@ -889,8 +912,9 @@ class VTKPipeline:
         mapper.SetInputConnection(tube.GetOutputPort())
         mapper.SetScalarModeToUsePointFieldData()
         mapper.SelectColorArray("particle_speed")
-        lo, hi = self.scalar_ranges["speed"]
-        mapper.SetScalarRange(lo, hi)
+        # lo, hi = self.scalar_ranges["speed"]
+        # mapper.SetScalarRange(lo, hi)
+        mapper.SetScalarRange(0.0, max(0.8, float(self.config.ux) * 2.0))
         mapper.SetLookupTable(self.ctfs["speed"])
 
         actor = vtk.vtkActor()
@@ -1176,7 +1200,7 @@ class VTKPipeline:
         for wave in self._live_particle_waves:
             positions = wave['positions']
             vel = self._sample_velocity(data, positions)
-            wave['speeds'] = np.linalg.norm(vel, axis=1).astype(np.float32)
+            wave['speeds'] = self._sample_particle_speed(data, positions, vel)
             new_pos = (positions + dt * vel).astype(np.float32)
             new_pos[:, 0] = np.clip(new_pos[:, 0], x_min, x_max)
             new_pos[:, 1] = np.clip(new_pos[:, 1], y_min, y_max)
@@ -1226,14 +1250,72 @@ class VTKPipeline:
                 inside |= dist <= max(defn.radius + buf, min(self.config.dx, self.config.dy))
         return inside
 
+    # def _sample_velocity(self, data, positions: np.ndarray) -> np.ndarray:
+    #     if positions.size == 0 or data is None:
+    #         return np.zeros((0, 2), dtype=np.float32)
+
+    #     pd = data.GetPointData()
+    #     vx_arr = pd.GetArray("viz_vx") or pd.GetArray("vx")
+    #     vy_arr = pd.GetArray("viz_vy") or pd.GetArray("vy")
+    #     if vx_arr is None or vy_arr is None:
+    #         return np.zeros((positions.shape[0], 2), dtype=np.float32)
+
+    #     dims = data.GetDimensions()
+    #     nx, ny = dims[0], dims[1]
+    #     if nx < 2 or ny < 2:
+    #         return np.zeros((positions.shape[0], 2), dtype=np.float32)
+
+    #     origin = data.GetOrigin()
+    #     spacing = data.GetSpacing()
+    #     fx = (positions[:, 0] - origin[0]) / max(spacing[0], 1.0e-6)
+    #     fy = (positions[:, 1] - origin[1]) / max(spacing[1], 1.0e-6)
+
+    #     fx = np.clip(fx, 0.0, nx - 1.001)
+    #     fy = np.clip(fy, 0.0, ny - 1.001)
+
+    #     i0 = np.floor(fx).astype(np.int32)
+    #     j0 = np.floor(fy).astype(np.int32)
+    #     i1 = np.clip(i0 + 1, 0, nx - 1)
+    #     j1 = np.clip(j0 + 1, 0, ny - 1)
+    #     tx = (fx - i0).astype(np.float32)
+    #     ty = (fy - j0).astype(np.float32)
+
+    #     vx = vtk_to_numpy(vx_arr).reshape((nx, ny), order="F").astype(np.float32, copy=False)
+    #     vy = vtk_to_numpy(vy_arr).reshape((nx, ny), order="F").astype(np.float32, copy=False)
+
+    #     def interp(field):
+    #         f00 = field[i0, j0]
+    #         f10 = field[i1, j0]
+    #         f01 = field[i0, j1]
+    #         f11 = field[i1, j1]
+    #         return (
+    #             (1.0 - tx) * (1.0 - ty) * f00
+    #             + tx * (1.0 - ty) * f10
+    #             + (1.0 - tx) * ty * f01
+    #             + tx * ty * f11
+    #         )
+
+    #     return np.column_stack([interp(vx), interp(vy)]).astype(np.float32)
     def _sample_velocity(self, data, positions: np.ndarray) -> np.ndarray:
+        """
+        Sample obstacle-aware velocity at particle positions.
+
+        Important:
+        - Prefer viz_vx/viz_vy because those include obstacle deflection.
+        - If viz velocity is missing or zero at a particle, fall back to raw vx/vy.
+        - Do not rely on VTK object truthiness with `or`; explicitly check None.
+        """
         if positions.size == 0 or data is None:
             return np.zeros((0, 2), dtype=np.float32)
 
         pd = data.GetPointData()
-        vx_arr = pd.GetArray("viz_vx") or pd.GetArray("vx")
-        vy_arr = pd.GetArray("viz_vy") or pd.GetArray("vy")
-        if vx_arr is None or vy_arr is None:
+
+        viz_vx_arr = pd.GetArray("viz_vx")
+        viz_vy_arr = pd.GetArray("viz_vy")
+        raw_vx_arr = pd.GetArray("vx")
+        raw_vy_arr = pd.GetArray("vy")
+
+        if raw_vx_arr is None or raw_vy_arr is None:
             return np.zeros((positions.shape[0], 2), dtype=np.float32)
 
         dims = data.GetDimensions()
@@ -1243,6 +1325,7 @@ class VTKPipeline:
 
         origin = data.GetOrigin()
         spacing = data.GetSpacing()
+
         fx = (positions[:, 0] - origin[0]) / max(spacing[0], 1.0e-6)
         fy = (positions[:, 1] - origin[1]) / max(spacing[1], 1.0e-6)
 
@@ -1253,25 +1336,139 @@ class VTKPipeline:
         j0 = np.floor(fy).astype(np.int32)
         i1 = np.clip(i0 + 1, 0, nx - 1)
         j1 = np.clip(j0 + 1, 0, ny - 1)
+
         tx = (fx - i0).astype(np.float32)
         ty = (fy - j0).astype(np.float32)
 
-        vx = vtk_to_numpy(vx_arr).reshape((nx, ny), order="F").astype(np.float32, copy=False)
-        vy = vtk_to_numpy(vy_arr).reshape((nx, ny), order="F").astype(np.float32, copy=False)
+        def interp_array(arr):
+            field = vtk_to_numpy(arr).reshape((nx, ny), order="F").astype(np.float32, copy=False)
 
-        def interp(field):
             f00 = field[i0, j0]
             f10 = field[i1, j0]
             f01 = field[i0, j1]
             f11 = field[i1, j1]
+
             return (
                 (1.0 - tx) * (1.0 - ty) * f00
                 + tx * (1.0 - ty) * f10
                 + (1.0 - tx) * ty * f01
                 + tx * ty * f11
-            )
+            ).astype(np.float32)
 
-        return np.column_stack([interp(vx), interp(vy)]).astype(np.float32)
+        raw_vx = interp_array(raw_vx_arr)
+        raw_vy = interp_array(raw_vy_arr)
+        raw_vel = np.column_stack([raw_vx, raw_vy]).astype(np.float32)
+
+        if viz_vx_arr is None or viz_vy_arr is None:
+            vel = raw_vel
+        else:
+            viz_vx = interp_array(viz_vx_arr)
+            viz_vy = interp_array(viz_vy_arr)
+            viz_vel = np.column_stack([viz_vx, viz_vy]).astype(np.float32)
+
+            # If obstacle-aware velocity exists but is zero/stale at a point,
+            # use the raw solver velocity for that point.
+            viz_mag = np.linalg.norm(viz_vel, axis=1)
+            raw_mag = np.linalg.norm(raw_vel, axis=1)
+            use_raw = (viz_mag < 1.0e-7) & (raw_mag > 1.0e-7)
+
+            vel = viz_vel
+            vel[use_raw] = raw_vel[use_raw]
+
+        vel[~np.isfinite(vel)] = 0.0
+        return vel.astype(np.float32)
+    
+    def _sample_scalar(self, data, positions: np.ndarray, array_name: str) -> np.ndarray:
+        """Sample a scalar point-data array at floating-point XY positions."""
+        if positions.size == 0 or data is None:
+            return np.zeros(0, dtype=np.float32)
+
+        pd = data.GetPointData()
+        arr = pd.GetArray(array_name)
+        if arr is None:
+            return np.zeros(positions.shape[0], dtype=np.float32)
+
+        dims = data.GetDimensions()
+        nx, ny = dims[0], dims[1]
+        if nx < 2 or ny < 2:
+            return np.zeros(positions.shape[0], dtype=np.float32)
+
+        origin = data.GetOrigin()
+        spacing = data.GetSpacing()
+
+        fx = (positions[:, 0] - origin[0]) / max(spacing[0], 1.0e-6)
+        fy = (positions[:, 1] - origin[1]) / max(spacing[1], 1.0e-6)
+
+        fx = np.clip(fx, 0.0, nx - 1.001)
+        fy = np.clip(fy, 0.0, ny - 1.001)
+
+        i0 = np.floor(fx).astype(np.int32)
+        j0 = np.floor(fy).astype(np.int32)
+        i1 = np.clip(i0 + 1, 0, nx - 1)
+        j1 = np.clip(j0 + 1, 0, ny - 1)
+
+        tx = (fx - i0).astype(np.float32)
+        ty = (fy - j0).astype(np.float32)
+
+        field = vtk_to_numpy(arr).reshape((nx, ny), order="F").astype(np.float32, copy=False)
+
+        f00 = field[i0, j0]
+        f10 = field[i1, j0]
+        f01 = field[i0, j1]
+        f11 = field[i1, j1]
+
+        return (
+            (1.0 - tx) * (1.0 - ty) * f00
+            + tx * (1.0 - ty) * f10
+            + (1.0 - tx) * ty * f01
+            + tx * ty * f11
+        ).astype(np.float32)
+
+
+    # def _sample_particle_speed(self, data, positions: np.ndarray, velocity: np.ndarray | None = None) -> np.ndarray:
+    #     """
+    #     Get display speed for particles.
+
+    #     Prefer viz_speed if available, fallback to raw speed, then fallback to
+    #     norm of sampled velocity.
+    #     """
+    #     if positions.size == 0:
+    #         return np.zeros(0, dtype=np.float32)
+
+    #     viz_speed = self._sample_scalar(data, positions, "viz_speed")
+    #     raw_speed = self._sample_scalar(data, positions, "speed")
+
+    #     speed = np.where(viz_speed > 1.0e-6, viz_speed, raw_speed)
+
+    #     if velocity is not None and velocity.size > 0:
+    #         vel_speed = np.linalg.norm(velocity, axis=1).astype(np.float32)
+    #         speed = np.where(speed > 1.0e-6, speed, vel_speed)
+
+    #     return speed.astype(np.float32)
+    def _sample_particle_speed(self, data, positions: np.ndarray, velocity: np.ndarray | None = None) -> np.ndarray:
+        """
+        Particle speed should come from the actual velocity used to move the particle.
+        The grid scalar arrays are only a fallback.
+        """
+        if positions.size == 0:
+            return np.zeros(0, dtype=np.float32)
+
+        if velocity is not None and velocity.size > 0:
+            speed = np.linalg.norm(velocity, axis=1).astype(np.float32)
+        else:
+            vel = self._sample_velocity(data, positions)
+            speed = np.linalg.norm(vel, axis=1).astype(np.float32)
+
+        # Fallback only where velocity sampling really produced zero.
+        zero_mask = speed <= 1.0e-7
+        if np.any(zero_mask):
+            viz_speed = self._sample_scalar(data, positions, "viz_speed")
+            raw_speed = self._sample_scalar(data, positions, "speed")
+            fallback = np.where(viz_speed > 1.0e-7, viz_speed, raw_speed).astype(np.float32)
+            speed[zero_mask] = fallback[zero_mask]
+
+        speed[~np.isfinite(speed)] = 0.0
+        return speed.astype(np.float32)
 
     def _precompute_particle_history(self):
         self._particle_seed_pool = self._build_particle_seed_pool()
@@ -1323,7 +1520,9 @@ class VTKPipeline:
                 mid[:, 0] = np.clip(mid[:, 0], x_min, x_max)
                 mid[:, 1] = np.clip(mid[:, 1], y_min, y_max)
                 k2 = self._sample_velocity(data, mid)
-                spds = np.linalg.norm(k2, axis=1).astype(np.float32)
+                # spds = np.linalg.norm(k2, axis=1).astype(np.float32)
+                # wave['speeds'].append(spds)
+                spds = self._sample_particle_speed(data, mid, k2)
                 wave['speeds'].append(spds)
 
                 next_positions = positions + dt * k2
@@ -1379,7 +1578,9 @@ class VTKPipeline:
                 point_speeds = np.concatenate([w['speeds'] for w in self._live_particle_waves], axis=0)
             else:
                 points_xy = self._particle_seed_pool
-                point_speeds = np.zeros(points_xy.shape[0], dtype=np.float32)
+                data = self._get_current_data()
+                vel = self._sample_velocity(data, points_xy)
+                point_speeds = self._sample_particle_speed(data, points_xy, vel)
         else:
             if self._particle_waves:
                 frame_idx = int(np.clip(frame_idx, 0, self.num_frames - 1))
@@ -1429,6 +1630,28 @@ class VTKPipeline:
             existing.Modified()
         pd.SetActiveScalars("particle_speed")
         self._particle_poly.Modified()
+
+        # Use the actual visible particle speeds to scale particle/trail colors.
+        # This keeps the range data-driven instead of hard-coding 0.0 -> 0.50.
+        if point_speeds.size > 0:
+            valid_speeds = point_speeds[np.isfinite(point_speeds)]
+            valid_speeds = valid_speeds[valid_speeds > 1.0e-6]
+
+            if valid_speeds.size > 0:
+                lo = 0.0
+                hi = float(np.percentile(valid_speeds, 98.0))
+
+                # Add a little headroom so the fastest few particles don't all saturate.
+                hi *= 1.10
+
+                if hi <= lo:
+                    hi = lo + 1.0
+
+                if self._particle_mapper:
+                    self._particle_mapper.SetScalarRange(lo, hi)
+
+                if self._particle_trail_mapper:
+                    self._particle_trail_mapper.SetScalarRange(lo, hi)
 
         trail_points = vtk.vtkPoints()
         trail_lines = vtk.vtkCellArray()

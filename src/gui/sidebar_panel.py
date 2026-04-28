@@ -77,11 +77,11 @@ class SidebarPanel(QWidget):
 
         layout.addWidget(QLabel("Scalar Field"))
         self.scalar_combo = QComboBox()
-        self.scalar_combo.addItems(["Height", "Velocity", "Pressure", "Vorticity"])
+        self.scalar_combo.addItems(["Height", "Velocity", "Pressure", "LAVD"])
         self.scalar_combo.currentTextChanged.connect(self.scalar_field_changed.emit)
         layout.addWidget(self.scalar_combo)
 
-        self.layers = ["water surface", "particles", "particle trails", "contours"]
+        self.layers = ["water surface", "particles", "particle trails", "vorticity"]
         self.layer_checks = []
         for layer in self.layers:
             checkbox = QCheckBox(layer)
