@@ -1071,17 +1071,15 @@ class VTKPipeline:
             0.28,
         )
         particle_bar = self._make_scalar_bar("Particle Speed", self.ctfs["speed"], 0.01, 0.67, 0.24)
-        trail_bar = self._make_scalar_bar("Trail Speed", self.ctfs["speed"], 0.01, 0.38, 0.24)
-        contour_bar = self._make_scalar_bar("Vorticity", self.ctfs["vorticity"], 0.01, 0.09, 0.24)
+        #trail_bar = self._make_scalar_bar("Trail Speed", self.ctfs["speed"], 0.01, 0.38, 0.24)
 
-        for bar in (surface_bar, particle_bar, trail_bar, contour_bar):
+        for bar in (surface_bar, particle_bar):
             self.renderer.AddActor2D(bar)
 
         self.scalar_bars = {
             "surface": surface_bar,
             "particles": particle_bar,
-            "particle_trails": trail_bar,
-            "contours": contour_bar,
+            #"particle_trails": trail_bar,
         }
         self._update_scalar_bar_visibility()
 
@@ -1090,8 +1088,7 @@ class VTKPipeline:
             return
         self.scalar_bars["surface"].SetVisibility(self.show_surface)
         self.scalar_bars["particles"].SetVisibility(self.show_particles)
-        self.scalar_bars["particle_trails"].SetVisibility(self.show_particle_trails)
-        self.scalar_bars["contours"].SetVisibility(self.show_contours)
+        #self.scalar_bars["particle_trails"].SetVisibility(self.show_particle_trails)
 
     def _compute_obstacle_grid_mask(self):
         """Precompute a flat boolean mask of obstacle footprints on the live grid."""

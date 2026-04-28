@@ -77,7 +77,8 @@ class SidebarPanel(QWidget):
 
         layout.addWidget(QLabel("Scalar Field"))
         self.scalar_combo = QComboBox()
-        self.scalar_combo.addItems(["Height", "Velocity", "Pressure", "LAVD"])
+        #self.scalar_combo.addItems(["Height", "Velocity", "Pressure", "LAVD"])
+        self.scalar_combo.addItems(["Height", "LAVD"])
         self.scalar_combo.currentTextChanged.connect(self.scalar_field_changed.emit)
         layout.addWidget(self.scalar_combo)
 
