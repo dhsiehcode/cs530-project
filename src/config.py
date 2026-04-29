@@ -90,7 +90,7 @@ PRECONFIGURED_OBSTACLES = [
     ObstacleDef("Small Rock", "rock", radius=0.3 * 2, height=0.30),
     ObstacleDef("Medium Rock", "rock", radius=0.4 * 2, height=0.40),
     ObstacleDef("Large Rock", "rock", radius=0.55 * 2, height=0.55),
-    ObstacleDef("Small Log", "log", radius=0.15, height=0.40, length=1.5),
+    ObstacleDef("Small Log", "log", radius=0.20, height=0.40, length=1.5),
     ObstacleDef("Large Log", "log", radius=0.20, height=0.50, length=3.0),
 ]
 

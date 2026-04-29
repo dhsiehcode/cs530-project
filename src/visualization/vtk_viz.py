@@ -679,16 +679,13 @@ class VTKPipeline:
         self.ctfs["h"] = ctf_h
 
         ctf_s = vtk.vtkColorTransferFunction()
-        ctf_s.SetColorSpaceToLab()
+        ctf_s.SetColorSpaceToRGB()
 
-        # Now low speed is dark blue, not yellow.
-        # This makes it obvious when particles are actually slow/stalled.
-        ctf_s.AddRGBPoint(0.0,  0.18, 0.18, 0.18)  # dark gray
-        ctf_s.AddRGBPoint(0.18, 0.10, 0.45, 0.10)  # dark green
-        ctf_s.AddRGBPoint(0.38, 0.20, 0.75, 0.18)  # green
-        ctf_s.AddRGBPoint(0.58, 0.80, 0.85, 0.12)  # yellow-green
-        ctf_s.AddRGBPoint(0.78, 0.98, 0.60, 0.05)  # orange
-        ctf_s.AddRGBPoint(1.0,  0.88, 0.08, 0.05)  # red
+        ctf_s.AddRGBPoint(0.000, 0.95, 0.95, 0.00)  # yellow  (speed = 0.00)
+        ctf_s.AddRGBPoint(0.075, 0.95, 0.95, 0.00)  # yellow  (speed = 0.00)
+        ctf_s.AddRGBPoint(0.11, 0.97, 0.45, 0.00)  # orange  (speed = 0.075)
+        ctf_s.AddRGBPoint(0.150, 0.88, 0.05, 0.05)  # red     (speed = 0.15)
+        ctf_s.AddRGBPoint(1.000, 0.88, 0.05, 0.05)  # filler — clamps at red, never displayed
 
         self.ctfs["speed"] = ctf_s
         self.ctfs["viz_speed"] = ctf_s
@@ -1070,7 +1067,15 @@ class VTKPipeline:
             0.05,
             0.28,
         )
-        particle_bar = self._make_scalar_bar("Particle Speed", self.ctfs["speed"], 0.01, 0.67, 0.24)
+        particle_lut = vtk.vtkLookupTable()
+        particle_lut.SetRange(0.0, 0.15)
+        particle_lut.SetNumberOfTableValues(256)
+        for i in range(256):
+            t = i / 255.0 * 0.15  # sample at actual speed values 0..0.15
+            r, g, b = self.ctfs["speed"].GetColor(t)
+            particle_lut.SetTableValue(i, r, g, b, 1.0)
+        particle_lut.Build()
+        particle_bar = self._make_scalar_bar("Particle Speed", particle_lut, 0.01, 0.67, 0.24)
         #trail_bar = self._make_scalar_bar("Trail Speed", self.ctfs["speed"], 0.01, 0.38, 0.24)
 
         for bar in (surface_bar, particle_bar):

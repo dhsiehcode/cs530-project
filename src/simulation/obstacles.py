@@ -341,7 +341,7 @@ def create_log_mesh(obs: PlacedObstacle, warp_scale: float) -> vtk.vtkPolyData:
     cyl.Update()
 
     transform = vtk.vtkTransform()
-    transform.Translate(obs.x, obs.y, defn.radius * 0.5 + SimConfig.h0) ## shift up by h_0 in z?
+    transform.Translate(obs.x, obs.y, defn.radius * 0.5 + SimConfig.h0 + 0.2) ## shift up by h_0 in z?
     transform.RotateZ(defn.angle)   # rotate in xy-plane
 
 
