@@ -1538,6 +1538,7 @@ class VTKPipeline:
                 local_t = frame_idx - wave['spawn_frame']
                 stalled = spds < self.config.particle_respawn_speed_threshold
                 respawn_mask = outside | inside | (stalled & (local_t > 2))
+                respawn_mask = np.zeros(len(positions), dtype=bool)
 
                 next_positions[:, 0] = np.clip(next_positions[:, 0], x_min, x_max)
                 next_positions[:, 1] = np.clip(next_positions[:, 1], y_min, y_max)

@@ -1,3 +1,5 @@
+import time
+
 from PyQt5.QtCore import QObject, pyqtSignal, QThread
 
 from config import SimConfig, DATA_DIR
@@ -17,6 +19,7 @@ class RerenderWorker(QObject):
 
     def run(self):
         try:
+            _sim_start = time.perf_counter()
             self.progress.emit(0)
             init_taichi(self.config.use_gpu)
             total_steps = self.config.num_frames * self.config.steps_per_frame
@@ -54,4 +57,6 @@ class RerenderWorker(QObject):
             self.error.emit(str(e))
             return
 
+        elapsed = time.perf_counter() - _sim_start
+        print(f"Simulation completed in {elapsed:.2f} seconds")
         self.finished.emit()

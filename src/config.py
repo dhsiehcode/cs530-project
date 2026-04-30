@@ -39,7 +39,7 @@ class SimConfig:
     particle_focus_seed_count: int = 350
     particle_focus_half_height: float = 0.85
     particle_focus_upstream_offset: float = 0.55
-    particle_respawn_speed_threshold: float = 0.010
+    particle_respawn_speed_threshold: float = 0.00
     particle_respawn_jump_threshold: float = 0.45
 
     # Number of grid cells from each y-boundary to exclude from seeding and display
