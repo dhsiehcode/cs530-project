@@ -35,7 +35,7 @@ class SimConfig:
     particle_radius: float = 0.012
     particle_trail_radius: float = 0.008
     particle_trail_length: int = 5
-    particle_inlet_seed_count: int = 300
+    particle_inlet_seed_count: int = 500
     particle_focus_seed_count: int = 350
     particle_focus_half_height: float = 0.85
     particle_focus_upstream_offset: float = 0.55

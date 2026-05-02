@@ -16,7 +16,7 @@ from visualization.vtk_viz import VTKPipeline
 class MainWindow(QMainWindow):
     def __init__(self, config: SimConfig):
         super().__init__()
-        self.setWindowTitle("SWE Visualization")
+        self.setWindowTitle("Shallow Water Stream with Obstacles Visualization")
         self.config = config
 
         self.sidebar = SidebarPanel(config=self.config)
